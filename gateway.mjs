@@ -586,7 +586,7 @@ function createAnthropicTranslator(messageId, model) {
 
 function createResponsesTranslator(responseId, model) {
   let textContent = '', started = false, inputTokens = 0, outputTokens = 0;
-  return function translate(ndjsonLines) {
+  function translate(ndjsonLines) {
     const events = [];
     for (const line of ndjsonLines) {
       if (!line.trim()) continue;
@@ -600,16 +600,20 @@ function createResponsesTranslator(responseId, model) {
       } else if (type === 'text-delta' || type === 'reasoning-delta') {
         const text = ev.text || '';
         if (text) { textContent += text; events.push({ event: 'response.output_item.delta', data: { type: 'response.output_item.delta', delta: { type: 'content.delta', content_index: 0, text } } }); }
-      } else if (type === 'start-step' || type === 'text-start' || type === 'reasoning-start' || type === 'text-end' || type === 'reasoning-end') {}
-      else if (type === 'finish-step') {
+      } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0;
       }
     }
-    events.push({ event: 'response.output_item.done', data: { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] } } });
-    events.push({ event: 'response.completed', data: { type: 'response.completed', response: { id: responseId, model, status: 'completed', usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] }] } } });
     return events;
-  };
+  }
+  function finalize() {
+    return [
+      { event: 'response.output_item.done', data: { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] } } },
+      { event: 'response.completed', data: { type: 'response.completed', response: { id: responseId, model, status: 'completed', usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] }] } } }
+    ];
+  }
+  return { translate, finalize };
 }
 
 // ── Request Handlers ────────────────────────────────────────────────────────
@@ -702,6 +706,7 @@ async function handleMessages(req, res) {
       const events = translate([buffer]);
       for (const ev of events) sseWrite(res, ev.event, ev.data);
     }
+    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
     res.end();
   } catch (e) {
     log('error', `Request error: ${e.message}`);
@@ -732,7 +737,7 @@ async function handleResponses(req, res) {
     }
 
     sseHeaders(res);
-    const translate = createResponsesTranslator(responseId, model);
+    const { translate, finalize } = createResponsesTranslator(responseId, model);
     const reader = ccRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
