@@ -551,17 +551,12 @@ function createOpenAiTranslator(completionId, model) {
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
         chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
-      } else if (type === 'error') {
-        const msg = ev.error?.message || 'CC API error';
-        events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '[ERROR: ' + msg + ']' } } });
       } else if (type === 'finish') {
-        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } });
-        const sr = ev.finishReason === 'length' ? 'max_tokens' : 'end_turn';
-        events.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: sr }, usage: { output_tokens: outputTokens } } });
-        events.push({ event: 'message_stop', data: { type: 'message_stop' } });
+        const fr = ev.finishReason === 'length' ? 'length' : 'stop';
+        chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
       }
     }
-    return events;
+    return chunks;
   };
 }
 
@@ -747,6 +742,8 @@ async function handleResponses(req, res) {
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else res.end();
   }
+
+    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
 }
 
 function handleModels(req, res) {
