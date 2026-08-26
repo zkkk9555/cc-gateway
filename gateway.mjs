@@ -321,14 +321,17 @@ async function forwardToCCViaProxy(body, apiKey, signal) {
           }
 
           // Streaming response: create a ReadableStream from the socket
+          let streamClosed = false;
           const stream = new ReadableStream({
             start(ctrl) {
               if (bodyData) ctrl.enqueue(new TextEncoder().encode(bodyData));
               tlsSocket.on('data', (chunk) => {
-                ctrl.enqueue(chunk);
+                if (!streamClosed) {
+                  try { ctrl.enqueue(chunk); } catch {}
+                }
               });
-              tlsSocket.on('end', () => ctrl.close());
-              tlsSocket.on('error', (e) => ctrl.error(e));
+              tlsSocket.on('end', () => { streamClosed = true; try { ctrl.close(); } catch {} });
+              tlsSocket.on('error', (e) => { streamClosed = true; try { ctrl.error(e); } catch {} });
             }
           });
 
@@ -719,6 +722,102 @@ function createOpenAiTranslator(completionId, model) {
   };
 }
 
+// ── NDJSON → Anthropic SSE Translation ─────────────────────────────────────
+
+function createAnthropicTranslator(messageId, model) {
+  let inputTokens = 0, outputTokens = 0;
+  let started = false;
+  let blockIndex = 0;
+  let blockOpen = false;
+  let currentText = '';
+  let currentToolId = '', currentToolName = '', currentToolArgs = '';
+
+  function translate(ndjsonLines) {
+    const events = [];
+    for (const line of ndjsonLines) {
+      if (!line.trim()) continue;
+      let ev;
+      try { ev = JSON.parse(line); } catch { continue; }
+      const type = ev.type || '';
+
+      if (type === 'start' && !started) {
+        started = true;
+        events.push({ event: 'message_start', data: {
+          type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
+        }});
+      } else if (type === 'text-start') {
+        // Close previous block if still open (no explicit end event)
+        if (blockOpen) {
+          events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
+          blockIndex++;
+        }
+        blockOpen = true;
+        currentText = '';
+        events.push({ event: 'content_block_start', data: {
+          type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' }
+        }});
+      } else if (type === 'text-delta' || type === 'reasoning-delta') {
+        const text = ev.text || '';
+        if (text) events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text }
+        }});
+      } else if (type === 'text-end' || type === 'reasoning-end') {
+        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
+        blockOpen = false;
+        blockIndex++;
+      } else if (type === 'tool-input-start') {
+        // Close previous block if still open
+        if (blockOpen) {
+          events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
+          blockIndex++;
+        }
+        blockOpen = true;
+        currentToolId = ev.id || '';
+        currentToolName = ev.toolName || '';
+        currentToolArgs = '';
+        events.push({ event: 'content_block_start', data: {
+          type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id: currentToolId, name: currentToolName, input: {} }
+        }});
+      } else if (type === 'tool-input-delta') {
+        currentToolArgs += (ev.delta || '');
+      } else if (type === 'tool-input-end') {
+        events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: currentToolArgs }
+        }});
+        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
+        blockOpen = false;
+        blockIndex++;
+        // Already handled via tool-input-end
+      } else if (type === 'finish-step') {
+        const u = ev.usage || {};
+        inputTokens = u.inputTokens || 0;
+        outputTokens = u.outputTokens || 0;
+      } else if (type === 'error') {
+        const msg = ev.error?.message || 'CC API error';
+        events.push({ event: 'content_block_start', data: {
+          type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' }
+        }});
+        events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '[ERROR: ' + msg + ']' }
+        }});
+        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
+        blockIndex++;
+      }
+    }
+    return events;
+  }
+
+  function finalize() {
+    const stopReason = 'end_turn';
+    return [
+      { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } } },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ];
+  }
+
+  return { translate, finalize };
+}
+
 // ── NDJSON → Responses SSE Translation ──────────────────────────────────────
 
 function createResponsesTranslator(responseId, model) {
@@ -883,7 +982,7 @@ async function handleMessages(req, res) {
     }
 
     sseHeaders(res);
-    const translate = createAnthropicTranslator(messageId, model);
+    const { translate, finalize } = createAnthropicTranslator(messageId, model);
     const reader = ccRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
