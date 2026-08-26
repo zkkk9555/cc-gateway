@@ -736,14 +736,13 @@ async function handleResponses(req, res) {
       const events = translate([buffer]);
       for (const ev of events) sseWrite(res, ev.event, ev.data);
     }
+    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
     res.end();
   } catch (e) {
     log('error', `Request error: ${e.message}`);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else res.end();
   }
-
-    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
 }
 
 function handleModels(req, res) {
