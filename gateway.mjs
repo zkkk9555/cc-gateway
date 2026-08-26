@@ -769,36 +769,91 @@ async function handleChatCompletions(req, res) {
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const ccBody = buildCcRequest(openaiReq);
   log('info', `Request: ${model} /v1/chat/completions`);
+  log('debug', `Request body`, { model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
 
   try {
-    const ccRes = await forwardToCC(ccBody, apiKey);
-    if (!ccRes.ok) {
-      const errText = await ccRes.text().catch(() => '');
-      log('error', `CC error: ${ccRes.status}`);
-      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message: errText.slice(0, 500) || `CC API error: ${ccRes.status}`, type: 'proxy_error' } });
+    // Retry on transient errors — buffer first events before committing to client
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 2000;
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model}`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+        completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
+      }
+
+      const ccRes = await forwardToCC(ccBody, apiKey);
+      if (!ccRes.ok) {
+        const errText = await ccRes.text().catch(() => '');
+        log('error', `CC error: ${ccRes.status} ${model} ${errText.slice(0, 300)}`);
+        return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message: errText.slice(0, 500) || `CC API error: ${ccRes.status}`, type: 'proxy_error' } });
+      }
+
+      // Phase 1: Buffer initial events (before headers) to detect transient errors
+      const translate = createOpenAiTranslator(completionId, model);
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let preHeadersChunks = [];
+      let earlyError = null;
+
+      // Read until we see content or error, then decide
+      const MAX_PRE_BUFFER = 20; // max events to buffer before committing
+      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        const chunks = translate(lines);
+        for (const chunk of chunks) {
+          const delta = chunk.choices?.[0]?.delta?.content || '';
+          const fr = chunk.choices?.[0]?.finish_reason;
+          if (delta.startsWith('[ERROR:') && delta.includes('Service temporarily unavailable')) {
+            earlyError = delta;
+          }
+          preHeadersChunks.push(chunk);
+          // If we got actual content or finish, stop buffering and commit
+          if ((delta && !delta.startsWith('[ERROR:')) || fr) break;
+        }
+        if (earlyError || (preHeadersChunks.some(c => c.choices?.[0]?.delta?.content && !c.choices[0].delta.content.startsWith('[ERROR:')))) break;
+      }
+
+      // Transient error before any real content → retry
+      if (earlyError && attempt < MAX_RETRIES) {
+        log('warn', `Transient error on ${model}, retrying: ${earlyError.slice(0, 100)}`);
+        lastError = earlyError;
+        reader.cancel().catch(() => {});
+        continue;
+      }
+
+      // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
+      sseHeaders(res);
+      for (const chunk of preHeadersChunks) sseData(res, chunk);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        const chunks = translate(lines);
+        for (const chunk of chunks) sseData(res, chunk);
+      }
+      if (buffer.trim()) {
+        const chunks = translate([buffer]);
+        for (const chunk of chunks) sseData(res, chunk);
+      }
+
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
     }
 
-    sseHeaders(res);
-    const translate = createOpenAiTranslator(completionId, model);
-    const reader = ccRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      const chunks = translate(lines);
-      for (const chunk of chunks) sseData(res, chunk);
-    }
-    if (buffer.trim()) {
-      const chunks = translate([buffer]);
-      for (const chunk of chunks) sseData(res, chunk);
-    }
-    res.write('data: [DONE]\n\n');
-    res.end();
+    log('error', `All ${MAX_RETRIES} retries exhausted for ${model}: ${lastError}`);
+    if (!res.headersSent) jsonRes(res, 503, { error: { message: lastError || 'Service temporarily unavailable after retries', type: 'proxy_error' } });
   } catch (e) {
     log('error', `Request error: ${e.message}`);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
