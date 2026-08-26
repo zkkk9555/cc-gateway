@@ -1,7 +1,7 @@
 {
   "port": 3050,
   "host": "0.0.0.0",
-  "api_key": "",
+  "api_key": "user_REDACTED",
   "api_base": "https://api.commandcode.ai",
   "log_level": "info"
 }

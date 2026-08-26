@@ -11,6 +11,14 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+
+// Bypass Clash proxy — connect directly via ISP
+// Bypass Clash proxy — direct ISP connection
+process.env.HTTP_PROXY = '';
+process.env.HTTPS_PROXY = '';
+process.env.http_proxy = '';
+process.env.https_proxy = '';
+process.env.NO_PROXY = '*';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -540,37 +548,12 @@ function createOpenAiTranslator(completionId, model) {
         inputTokens = u.inputTokens || 0;
         outputTokens = u.outputTokens || 0;
         cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
-      } else if (type === 'finish') {
-        const fr = ev.finishReason === 'length' ? 'length' : 'stop';
-        chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
-      }
-    }
-    return chunks;
-  };
-}
-
-// ── NDJSON → Anthropic SSE Translation ──────────────────────────────────────
-
-function createAnthropicTranslator(messageId, model) {
-  let textContent = '', inputTokens = 0, outputTokens = 0, cachedTokens = 0, started = false;
-  return function translate(ndjsonLines) {
-    const events = [];
-    for (const line of ndjsonLines) {
-      if (!line.trim()) continue;
-      let ev;
-      try { ev = JSON.parse(line); } catch { continue; }
-      const type = ev.type || '';
-      if (type === 'start' && !started) {
-        started = true;
-        events.push({ event: 'message_start', data: { type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', content: [], model, usage: { input_tokens: 0, output_tokens: 0 } } } });
-        events.push({ event: 'content_block_start', data: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } });
-      } else if (type === 'text-delta' || type === 'reasoning-delta') {
-        const text = ev.text || '';
-        if (text) { textContent += text; events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } } }); }
-      } else if (type === 'start-step' || type === 'text-start' || type === 'reasoning-start' || type === 'text-end' || type === 'reasoning-end') {}
-      else if (type === 'finish-step') {
-        const u = ev.usage || {};
-        inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0; cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
+      } else if (type === 'error') {
+        const msg = ev.error?.message || 'CC API error';
+        chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
+      } else if (type === 'error') {
+        const msg = ev.error?.message || 'CC API error';
+        events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '[ERROR: ' + msg + ']' } } });
       } else if (type === 'finish') {
         events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: 0 } });
         const sr = ev.finishReason === 'length' ? 'max_tokens' : 'end_turn';
@@ -600,6 +583,9 @@ function createResponsesTranslator(responseId, model) {
       } else if (type === 'text-delta' || type === 'reasoning-delta') {
         const text = ev.text || '';
         if (text) { textContent += text; events.push({ event: 'response.output_item.delta', data: { type: 'response.output_item.delta', delta: { type: 'content.delta', content_index: 0, text } } }); }
+      } else if (type === 'error') {
+        const msg = ev.error?.message || 'CC API error';
+        textContent += '[ERROR: ' + msg + ']';
       } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0;
