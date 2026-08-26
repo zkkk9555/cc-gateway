@@ -9,16 +9,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import http from 'node:http';
+import https from 'node:https';
+import tls from 'node:tls';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-
-// Bypass Clash proxy — connect directly via ISP
-// Bypass Clash proxy — direct ISP connection
-process.env.HTTP_PROXY = '';
-process.env.HTTPS_PROXY = '';
-process.env.http_proxy = '';
-process.env.https_proxy = '';
-process.env.NO_PROXY = '*';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,7 +38,7 @@ if (args.includes('--version')) { console.log('cc-gateway v1.0.0'); process.exit
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_base: 'https://api.commandcode.ai', log_level: 'info' };
+const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 } };
 
 function loadConfig() {
   let cfg = { ...DEFAULT_CONFIG };
@@ -211,6 +206,147 @@ function fetchWithTimeout(url, opts = {}, timeoutMs = 60000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// ── SOCKS5 Proxy Tunnel ────────────────────────────────────────────────────
+
+function socks5Connect(proxyHost, proxyPort, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(proxyPort, proxyHost, () => {
+      // SOCKS5 greeting: version 5, 1 auth method (no auth)
+      socket.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
+    let step = 0;
+    socket.on('data', (data) => {
+      if (step === 0) {
+        if (data[0] !== 0x05 || data[1] !== 0x00) { reject(new Error('SOCKS5 auth failed')); return; }
+        step = 1;
+        const hostBuf = Buffer.from(targetHost);
+        const buf = Buffer.alloc(7 + hostBuf.length);
+        buf[0] = 0x05; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 0x03; // ATYP=domain
+        buf[4] = hostBuf.length;
+        hostBuf.copy(buf, 5);
+        buf.writeUInt16BE(targetPort, 5 + hostBuf.length);
+        socket.write(buf);
+      } else if (step === 1) {
+        if (data[1] !== 0x00) { reject(new Error('SOCKS5 connect failed: code=' + data[1])); return; }
+        resolve(socket);
+      }
+    });
+    socket.on('error', reject);
+    socket.setTimeout(10000, () => { socket.destroy(); reject(new Error('SOCKS5 timeout')); });
+  });
+}
+
+async function forwardToCCViaProxy(body, apiKey, signal) {
+  const sessionId = getSessionId(apiKey);
+  await ensureInitialized(apiKey);
+
+  const targetHost = new URL(CFG.api_base).hostname;
+  const targetPort = 443;
+  const targetPath = '/alpha/generate';
+
+  const proxyHost = CFG.proxy?.host || '127.0.0.1';
+  const proxyPort = CFG.proxy?.port || 7897;
+
+  const payload = JSON.stringify(body);
+
+  const tunnelSocket = await socks5Connect(proxyHost, proxyPort, targetHost, targetPort);
+
+  return new Promise((resolve, reject) => {
+    if (signal) signal.addEventListener('abort', () => { tunnelSocket.destroy(); reject(new Error('Aborted')); });
+
+    const tlsSocket = tls.connect({
+      socket: tunnelSocket,
+      servername: targetHost,
+    }, () => {
+      const headers = [
+        `POST ${targetPath} HTTP/1.1`,
+        `Host: ${targetHost}`,
+        'Content-Type: application/json',
+        `Authorization: Bearer ${apiKey}`,
+        'x-cli-environment: production',
+        `x-command-code-version: ${CC_VERSION}`,
+        `x-session-id: ${sessionId}`,
+        'x-co-flag: false',
+        'x-taste-learning: false',
+        `x-project-slug: ${fakeProjectSlug(sessionId)}`,
+        `traceparent: ${generateTraceparent()}`,
+        `Content-Length: ${Buffer.byteLength(payload)}`,
+        'Connection: close',
+        '', '',
+      ].join('\r\n');
+      tlsSocket.write(headers + payload);
+    });
+
+    tlsSocket.on('error', reject);
+
+    // Collect the response as a stream-like object for compatibility with existing handlers
+    const chunks = [];
+    let headersParsed = false;
+    let responseData = '';
+
+    tlsSocket.on('data', (chunk) => {
+      if (!headersParsed) {
+        responseData += chunk.toString();
+        const headerEnd = responseData.indexOf('\r\n\r\n');
+        if (headerEnd >= 0) {
+          headersParsed = true;
+          const statusLine = responseData.split('\r\n')[0];
+          const statusCode = parseInt(statusLine.split(' ')[1]) || 500;
+          const bodyData = responseData.slice(headerEnd + 4);
+
+          if (statusCode < 200 || statusCode >= 300) {
+            // Non-2xx: return as error response
+            resolve({
+              ok: false,
+              status: statusCode,
+              body: {
+                getReader() {
+                  const encoder = new TextEncoder();
+                  const encoded = encoder.encode(bodyData);
+                  let read = false;
+                  return {
+                    read() {
+                      if (!read) { read = true; return Promise.resolve({ done: false, value: encoded }); }
+                      return Promise.resolve({ done: true });
+                    }
+                  };
+                },
+                text() { return Promise.resolve(bodyData); },
+              },
+              text() { return Promise.resolve(bodyData); },
+            });
+            return;
+          }
+
+          // Streaming response: create a ReadableStream from the socket
+          const stream = new ReadableStream({
+            start(ctrl) {
+              if (bodyData) ctrl.enqueue(new TextEncoder().encode(bodyData));
+              tlsSocket.on('data', (chunk) => {
+                ctrl.enqueue(chunk);
+              });
+              tlsSocket.on('end', () => ctrl.close());
+              tlsSocket.on('error', (e) => ctrl.error(e));
+            }
+          });
+
+          resolve({
+            ok: true,
+            status: statusCode,
+            body: {
+              getReader() { return stream.getReader(); },
+            },
+          });
+        }
+      }
+    });
+
+    tlsSocket.on('end', () => {
+      if (!headersParsed) reject(new Error('Connection closed before response headers'));
+    });
+  });
 }
 
 function randomUUID() { return crypto.randomUUID(); }
@@ -477,6 +613,12 @@ function convertResponsesToOpenai(responsesReq) {
 // ── Forward to CC API ───────────────────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, signal) {
+  // Use SOCKS5 proxy if configured (bypasses CC's proxy detection)
+  if (CFG.proxy?.enabled) {
+    return forwardToCCViaProxy(body, apiKey, signal);
+  }
+
+  // Direct connection (original path)
   const sessionId = getSessionId(apiKey);
   await ensureInitialized(apiKey);
 
@@ -839,11 +981,12 @@ async function start() {
   await refreshCcVersion();
 
   server.listen(CFG.port, CFG.host, () => {
-    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
+    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port}` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
     console.log(`\n  cc-gateway v1.0.0`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
+    console.log(`  Proxy: ${CFG.proxy?.enabled ? 'socks5://' + CFG.proxy.host + ':' + CFG.proxy.port : 'off'}`);
     console.log(`  API Key: ${CFG.api_key ? CFG.api_key.slice(0, 8) + '…' : 'not set (pass via Authorization header)'}`);
     console.log(`\n  Endpoints:`);
     console.log(`    POST /v1/chat/completions   (OpenAI)`);
