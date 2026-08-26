@@ -1,11 +1,11 @@
 {
   "port": 3050,
   "host": "0.0.0.0",
-  "api_key": "user_REDACTED",
+  "api_key": "",
   "api_base": "https://api.commandcode.ai",
   "log_level": "info",
   "proxy": {
-    "enabled": true,
+    "enabled": false,
     "host": "127.0.0.1",
     "port": 7897
   }
