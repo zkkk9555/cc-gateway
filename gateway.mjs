@@ -671,6 +671,7 @@ function sseData(res, data) {
 
 function createOpenAiTranslator(completionId, model) {
   let inputTokens = 0, outputTokens = 0, cachedTokens = 0, roleSent = false;
+  let toolCallIndex = 0, currentToolId = '', currentToolName = '', currentToolArgs = '';
   return function translate(ndjsonLines) {
     const chunks = [];
     for (const line of ndjsonLines) {
@@ -685,7 +686,23 @@ function createOpenAiTranslator(completionId, model) {
         const text = ev.text || '';
         if (text) chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
       } else if (type === 'text-end' || type === 'reasoning-end') {}
-      else if (type === 'finish-step') {
+      // Tool call events from CC API
+      else if (type === 'tool-input-start') {
+        currentToolId = ev.id || '';
+        currentToolName = ev.toolName || '';
+        currentToolArgs = '';
+      } else if (type === 'tool-input-delta') {
+        currentToolArgs += (ev.delta || '');
+      } else if (type === 'tool-input-end') {
+        // Emit the tool call as a delta chunk
+        const idx = toolCallIndex++;
+        chunks.push({
+          id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model,
+          choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: currentToolId, type: 'function', function: { name: currentToolName, arguments: currentToolArgs } }] }, finish_reason: null }],
+        });
+      } else if (type === 'tool-call') {
+        // Final tool call confirmation (already emitted via tool-input-end)
+      } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0;
         outputTokens = u.outputTokens || 0;
@@ -694,7 +711,7 @@ function createOpenAiTranslator(completionId, model) {
         const msg = ev.error?.message || 'CC API error';
         chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
       } else if (type === 'finish') {
-        const fr = ev.finishReason === 'length' ? 'length' : 'stop';
+        const fr = ev.finishReason === 'length' ? 'length' : ev.finishReason === 'tool-calls' ? 'tool_calls' : 'stop';
         chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
       }
     }
