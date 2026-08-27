@@ -752,8 +752,8 @@ function convertResponsesToOpenai(responsesReq) {
 // ── Forward to CC API ───────────────────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, signal) {
-  const MAX_CC_RETRIES = 2;
-  const RETRY_DELAY = 1500;
+  const MAX_CC_RETRIES = 3;
+  const RETRY_DELAY = 300; // 300ms between connection retries
   let lastErr = null;
 
   for (let attempt = 0; attempt <= MAX_CC_RETRIES; attempt++) {
@@ -801,6 +801,14 @@ async function forwardToCC(body, apiKey, signal) {
 }
 
 // ── SSE Response Helpers ────────────────────────────────────────────────────
+
+// Read with timeout — if CC API stalls, we don't hang forever
+function readWithTimeout(reader, timeoutMs = 60000) {
+  return Promise.race([
+    reader.read(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Stream read timeout')), timeoutMs)),
+  ]);
+}
 
 function jsonRes(res, status, body, headers = {}) {
   const h = { 'Content-Type': 'application/json', ...headers };
@@ -1031,15 +1039,21 @@ async function handleChatCompletions(req, res) {
   log('debug', `Request body`, { client, model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
 
   try {
-    // Retry on transient errors — buffer first events before committing to client
-    const MAX_RETRIES = 3;
-    const RETRY_DELAY_MS = 2000;
+    // Aggressive retry on transient errors — retry fast, retry often
+    const MAX_RETRIES = 15; // up to 15 retries
+    const CONN_RETRY_DELAY = 500; // 500ms for connection errors
     let lastError = null;
+    let totalRetries = 0;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
-        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model}`);
-        await new Promise(r => setTimeout(r, RETRY_DELAY_MS * attempt));
+        totalRetries++;
+        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model} (total retries: ${totalRetries})`);
+        // No delay for 503 (service unavailable) — retry immediately
+        // Short delay for connection errors
+        if (!lastError?.includes('Service temporarily unavailable')) {
+          await new Promise(r => setTimeout(r, CONN_RETRY_DELAY));
+        }
         completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
       }
 
@@ -1061,7 +1075,7 @@ async function handleChatCompletions(req, res) {
       // Read until we see content or error, then decide
       const MAX_PRE_BUFFER = 20; // max events to buffer before committing
       for (let i = 0; i < MAX_PRE_BUFFER; i++) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readWithTimeout(reader);
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1090,7 +1104,7 @@ async function handleChatCompletions(req, res) {
 
       // All retries exhausted → return proper error
       if (earlyError) {
-        log('error', `All retries exhausted for ${model}: ${earlyError.slice(0, 200)}`);
+        log('error', `All ${totalRetries} retries exhausted for ${model}: ${earlyError.slice(0, 200)}`);
         reader.cancel().catch(() => {});
         return jsonRes(res, 503, { error: { message: earlyError.replace('[ERROR: ', '').replace(']', ''), type: 'proxy_error' } });
       }
@@ -1107,7 +1121,7 @@ async function handleChatCompletions(req, res) {
           if (chunk.usage) { inputTokens = chunk.usage.prompt_tokens || 0; outputTokens = chunk.usage.completion_tokens || 0; }
         }
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithTimeout(reader);
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
@@ -1129,21 +1143,35 @@ async function handleChatCompletions(req, res) {
       sseHeaders(res);
       for (const chunk of preHeadersChunks) sseData(res, chunk);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        const chunks = translate(lines);
-        for (const chunk of chunks) sseData(res, chunk);
+      let streamTimedOut = false;
+      try {
+        while (true) {
+          const { done, value } = await readWithTimeout(reader, 60000);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          const chunks = translate(lines);
+          for (const chunk of chunks) sseData(res, chunk);
+        }
+      } catch (e) {
+        if (e.message === 'Stream read timeout') {
+          log('warn', `Stream timeout on ${model} (60s no data)`);
+          streamTimedOut = true;
+          reader.cancel().catch(() => {});
+        } else throw e;
       }
       if (buffer.trim()) {
         const chunks = translate([buffer]);
         for (const chunk of chunks) sseData(res, chunk);
       }
 
-      res.write('data: [DONE]\n\n');
+      if (streamTimedOut) {
+        res.write(`data: ${JSON.stringify({id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{index: 0, delta: {content: '[ERROR: Upstream timeout — no response for 60s]'}, finish_reason: 'stop'}]})}\n\n`);
+        res.write('data: [DONE]\n\n');
+      } else {
+        res.write('data: [DONE]\n\n');
+      }
       res.end();
       return;
     }
@@ -1185,7 +1213,7 @@ async function handleMessages(req, res) {
       const decoder = new TextDecoder();
       let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readWithTimeout(reader);
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1213,7 +1241,7 @@ async function handleMessages(req, res) {
     let buffer = '';
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithTimeout(reader, 60000);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -1230,7 +1258,16 @@ async function handleMessages(req, res) {
   } catch (e) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
-    else res.end();
+    else {
+      // On timeout after headers sent, send error event and close
+      try {
+        sseWrite(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[ERROR: Upstream timeout — ${e.message}]` } });
+        sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        sseWrite(res, 'message_stop', { type: 'message_stop' });
+      } catch {}
+      res.end();
+    }
   }
 }
 
@@ -1262,7 +1299,7 @@ async function handleResponses(req, res) {
       const decoder = new TextDecoder();
       let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = await readWithTimeout(reader);
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
@@ -1290,7 +1327,7 @@ async function handleResponses(req, res) {
     let buffer = '';
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithTimeout(reader, 60000);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -1307,7 +1344,13 @@ async function handleResponses(req, res) {
   } catch (e) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
-    else res.end();
+    else {
+      try {
+        sseWrite(res, 'response.output_item.delta', { type: 'response.output_item.delta', delta: { type: 'content.delta', content_index: 0, text: `[ERROR: Upstream timeout — ${e.message}]` } });
+        sseWrite(res, 'response.completed', { type: 'response.completed', response: { id: responseId, status: 'completed' } });
+      } catch {}
+      res.end();
+    }
   }
 }
 
