@@ -383,6 +383,40 @@ function randomUUID() { return crypto.randomUUID(); }
 function nowUnix() { return Math.floor(Date.now() / 1000); }
 function getDateStr() { return new Date().toISOString().slice(0, 10); }
 
+// ── Client Detection ───────────────────────────────────────────────────────
+
+function detectClient(req, body) {
+  const path = req.url || '';
+  const headers = req.headers || {};
+
+  // Claude Code: uses /v1/messages + anthropic-version header
+  if (path.includes('/messages') && headers['anthropic-version']) return 'claude-code';
+
+  // Try to detect from request body
+  if (body) {
+    try {
+      const parsed = typeof body === 'string' ? JSON.parse(body) : body;
+
+      // Hermes: developer role + many tools (8+)
+      if (parsed.messages?.some(m => m.role === 'developer')) {
+        const toolCount = parsed.tools?.length || 0;
+        if (toolCount >= 8) return 'hermes';
+        return 'hermes-lite'; // developer role but few tools
+      }
+
+      // OpenCode: Chat Completions with tools but no developer role
+      if (parsed.tools?.length > 0 && !parsed.messages?.some(m => m.role === 'developer')) {
+        return 'opencode';
+      }
+    } catch {}
+  }
+
+  // Fallback: infer from endpoint
+  if (path.includes('/messages')) return 'anthropic-client';
+  if (path.includes('/responses')) return 'responses-client';
+  return 'unknown';
+}
+
 function generateTraceparent() {
   const trace = randHex(16);
   const parent = randHex(8);
@@ -894,8 +928,9 @@ async function handleChatCompletions(req, res) {
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   let completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const ccBody = buildCcRequest(openaiReq);
-  log('info', `Request: ${model} /v1/chat/completions`);
-  log('debug', `Request body`, { model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
+  const client = detectClient(req, openaiReq);
+  log('info', `Request: ${model} /v1/chat/completions [${client}]`);
+  log('debug', `Request body`, { client, model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
 
   try {
     // Retry on transient errors — buffer first events before committing to client
@@ -998,7 +1033,8 @@ async function handleMessages(req, res) {
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
   const openaiReq = convertAnthropicToOpenai(anthropicReq);
   const ccBody = buildCcRequest(openaiReq);
-  log('info', `Request: ${model} /v1/messages`);
+  const client = detectClient(req, anthropicReq);
+  log('info', `Request: ${model} /v1/messages [${client}]`);
 
   try {
     const ccRes = await forwardToCC(ccBody, apiKey);
@@ -1047,7 +1083,8 @@ async function handleResponses(req, res) {
   const responseId = `resp_${randomUUID().slice(0, 12)}`;
   const openaiReq = convertResponsesToOpenai(responsesReq);
   const ccBody = buildCcRequest(openaiReq);
-  log('info', `Request: ${model} /v1/responses`);
+  const client = detectClient(req, responsesReq);
+  log('info', `Request: ${model} /v1/responses [${client}]`);
 
   try {
     const ccRes = await forwardToCC(ccBody, apiKey);
