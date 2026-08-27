@@ -753,7 +753,7 @@ function convertResponsesToOpenai(responsesReq) {
 
 async function forwardToCC(body, apiKey, signal) {
   const MAX_CC_RETRIES = 3;
-  const RETRY_DELAY = 300; // 300ms between connection retries
+  const RETRY_DELAY = 500; // 500ms between retries
   let lastErr = null;
 
   for (let attempt = 0; attempt <= MAX_CC_RETRIES; attempt++) {
@@ -1040,20 +1040,16 @@ async function handleChatCompletions(req, res) {
 
   try {
     // Aggressive retry on transient errors — retry fast, retry often
-    const MAX_RETRIES = 15; // up to 15 retries
-    const CONN_RETRY_DELAY = 500; // 500ms for connection errors
+    const MAX_RETRIES = 20;
+    const RETRY_DELAY = 500; // 500ms between all retries
     let lastError = null;
     let totalRetries = 0;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       if (attempt > 0) {
         totalRetries++;
-        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model} (total retries: ${totalRetries})`);
-        // No delay for 503 (service unavailable) — retry immediately
-        // Short delay for connection errors
-        if (!lastError?.includes('Service temporarily unavailable')) {
-          await new Promise(r => setTimeout(r, CONN_RETRY_DELAY));
-        }
+        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model}`);
+        await new Promise(r => setTimeout(r, RETRY_DELAY));
         completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
       }
 
