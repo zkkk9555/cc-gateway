@@ -751,19 +751,34 @@ function convertResponsesToOpenai(responsesReq) {
 
 // ── Forward to CC API ───────────────────────────────────────────────────────
 
+// Smart routing: domestic models go direct, foreign models go through proxy
+const DOMESTIC_PREFIXES = ['minimax/', 'deepseek/', 'qwen/', 'glm/', 'yi/', 'baichuan/', 'moonshot/', 'doubao/', 'spark/', 'ernie/'];
+
+function useDirectRoute(model) {
+  if (!CFG.proxy?.enabled) return true; // no proxy configured → always direct
+  return DOMESTIC_PREFIXES.some(p => model.toLowerCase().startsWith(p));
+}
+
 async function forwardToCC(body, apiKey, signal) {
+  const model = body.params?.model || '';
+  const useProxy = !useDirectRoute(model);
+
+  if (model) {
+    log('debug', `Route: ${model} → ${useProxy ? 'proxy' : 'direct'}`);
+  }
+
   const MAX_CC_RETRIES = 3;
-  const RETRY_DELAY = 500; // 500ms between retries
+  const RETRY_DELAY = 500;
   let lastErr = null;
 
   for (let attempt = 0; attempt <= MAX_CC_RETRIES; attempt++) {
     if (attempt > 0) {
-      log('info', `CC reconnect ${attempt}/${MAX_CC_RETRIES}`);
+      log('info', `CC reconnect ${attempt}/${MAX_CC_RETRIES} (${useProxy ? 'proxy' : 'direct'})`);
       await new Promise(r => setTimeout(r, RETRY_DELAY));
     }
     try {
       let res;
-      if (CFG.proxy?.enabled) {
+      if (useProxy) {
         res = await forwardToCCViaProxy(body, apiKey, signal);
       } else {
         const sessionId = getSessionId(apiKey);
@@ -787,7 +802,6 @@ async function forwardToCC(body, apiKey, signal) {
       return res;
     } catch (e) {
       lastErr = e;
-      // Retry on connection-level errors (proxy disconnect, timeout, etc.)
       const retryable = e.message?.includes('Connection closed') ||
                          e.message?.includes('SOCKS5') ||
                          e.message?.includes('timeout') ||
@@ -1039,19 +1053,17 @@ async function handleChatCompletions(req, res) {
   log('debug', `Request body`, { client, model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
 
   try {
-    // Aggressive retry on transient errors — retry fast, retry often
-    const MAX_RETRIES = 20;
-    const RETRY_DELAY = 500; // 500ms between all retries
+    // 503 retry: keep trying for 60 seconds, no fixed delay
+    const RETRY_DEADLINE = Date.now() + 60000; // 60 seconds
     let lastError = null;
-    let totalRetries = 0;
+    let attempt = 0;
 
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    while (true) {
       if (attempt > 0) {
-        totalRetries++;
-        log('info', `Retry ${attempt}/${MAX_RETRIES} for ${model}`);
-        await new Promise(r => setTimeout(r, RETRY_DELAY));
+        log('info', `Retry ${attempt} for ${model} (${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
         completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
       }
+      attempt++;
 
       const ccRes = await forwardToCC(ccBody, apiKey);
       if (!ccRes.ok) {
@@ -1095,15 +1107,15 @@ async function handleChatCompletions(req, res) {
         log('warn', `Transient error on ${model}, retrying: ${earlyError.slice(0, 100)}`);
         lastError = earlyError;
         reader.cancel().catch(() => {});
+        // Check if we've exceeded the 60s deadline
+        if (Date.now() >= RETRY_DEADLINE) {
+          log('error', `Retry deadline reached for ${model} after ${attempt} attempts`);
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (60s): ${earlyError.replace('[ERROR: ', '').replace(']', '')}`, type: 'proxy_error' } });
+        }
         continue;
       }
 
-      // All retries exhausted → return proper error
-      if (earlyError) {
-        log('error', `All ${totalRetries} retries exhausted for ${model}: ${earlyError.slice(0, 200)}`);
-        reader.cancel().catch(() => {});
-        return jsonRes(res, 503, { error: { message: earlyError.replace('[ERROR: ', '').replace(']', ''), type: 'proxy_error' } });
-      }
+      // Non-retryable error or success → break out of retry loop
 
       // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
       if (openaiReq.stream === false) {
@@ -1569,7 +1581,7 @@ async function start() {
   await refreshModels();
 
   server.listen(CFG.port, CFG.host, () => {
-    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port}` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
+    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
     console.log(`\n  cc-gateway v1.0.0`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
