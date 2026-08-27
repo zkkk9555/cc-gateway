@@ -115,6 +115,82 @@ function logError(msg, error) {
   try { getLogFile().write(line + '\n'); } catch {}
 }
 
+// ── Token Usage Tracking ─────────────────────────────────────────────────────
+// Persisted to data/usage.json — survives restarts.
+
+const USAGE_FILE = path.join(__dirname, 'data', 'usage.json');
+const tokenUsage = new Map(); // key: "YYYY-MM-DD|model" → { input, output, requests }
+
+function getTodayStr() { return new Date().toISOString().slice(0, 10); }
+
+function loadUsage() {
+  try {
+    if (fs.existsSync(USAGE_FILE)) {
+      const obj = JSON.parse(fs.readFileSync(USAGE_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(obj)) tokenUsage.set(k, v);
+      log('info', `Usage loaded: ${tokenUsage.size} entries`);
+    }
+  } catch (e) { log('warn', `Usage load failed: ${e.message}`); }
+}
+
+function saveUsage() {
+  try {
+    const dir = path.dirname(USAGE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const obj = Object.fromEntries(tokenUsage);
+    fs.writeFileSync(USAGE_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+function recordTokens(model, inputTokens, outputTokens) {
+  const day = getTodayStr();
+  const key = `${day}|${model}`;
+  let entry = tokenUsage.get(key);
+  if (!entry) { entry = { input: 0, output: 0, requests: 0 }; tokenUsage.set(key, entry); }
+  entry.input += inputTokens;
+  entry.output += outputTokens;
+  entry.requests++;
+  // Cleanup days older than 30 days
+  const cutoff = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  for (const [k] of tokenUsage) {
+    if (k.split('|')[0] < cutoff) tokenUsage.delete(k);
+  }
+  saveUsage();
+}
+
+function getUsageSummary() {
+  const day = getTodayStr();
+  const models = [];
+  let totalInput = 0, totalOutput = 0, totalRequests = 0;
+  for (const [key, entry] of tokenUsage) {
+    if (!key.startsWith(day)) continue;
+    const model = key.split('|')[1];
+    models.push({ model, input: entry.input, output: entry.output, requests: entry.requests });
+    totalInput += entry.input;
+    totalOutput += entry.output;
+    totalRequests += entry.requests;
+  }
+  models.sort((a, b) => (b.input + b.output) - (a.input + a.output));
+  return { date: day, models, total: { input: totalInput, output: totalOutput, requests: totalRequests, tokens: totalInput + totalOutput } };
+}
+
+// ── In-Memory Log Buffer (for dashboard) ─────────────────────────────────────
+const logBuffer = [];
+const LOG_BUFFER_MAX = 200;
+
+function logToBuffer(level, msg) {
+  const ts = new Date().toISOString();
+  logBuffer.push({ ts, level, msg });
+  if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
+}
+
+// Patch log function to also buffer
+const _origLog = log;
+log = function(level, msg, data) {
+  _origLog(level, msg, data);
+  logToBuffer(level, msg);
+};
+
 // ── Fingerprint ─────────────────────────────────────────────────────────────
 
 const CPU_MODELS = ['12th Gen Intel(R) Core(TM) i7-12650H','13th Gen Intel(R) Core(TM) i7-13700K','13th Gen Intel(R) Core(TM) i9-13900K','Intel(R) Core(TM) Ultra 7 155H','AMD Ryzen 7 7800X3D','AMD Ryzen 9 7950X'];
@@ -776,6 +852,7 @@ function createOpenAiTranslator(completionId, model) {
       } else if (type === 'finish') {
         const fr = ev.finishReason === 'length' ? 'length' : ev.finishReason === 'tool-calls' ? 'tool_calls' : 'stop';
         chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
+        recordTokens(model, inputTokens, outputTokens);
       }
     }
     return chunks;
@@ -869,6 +946,7 @@ function createAnthropicTranslator(messageId, model) {
 
   function finalize() {
     const stopReason = 'end_turn';
+    recordTokens(model, inputTokens, outputTokens);
     return [
       { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } } },
       { event: 'message_stop', data: { type: 'message_stop' } },
@@ -907,6 +985,7 @@ function createResponsesTranslator(responseId, model) {
     return events;
   }
   function finalize() {
+    recordTokens(model, inputTokens, outputTokens);
     return [
       { event: 'response.output_item.done', data: { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] } } },
       { event: 'response.completed', data: { type: 'response.completed', response: { id: responseId, model, status: 'completed', usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] }] } } }
@@ -1191,6 +1270,97 @@ function readBody(req) {
   });
 }
 
+// ── Dashboard ────────────────────────────────────────────────────────────────
+
+let dashboardHtml = '';
+try { dashboardHtml = fs.readFileSync(path.join(__dirname, 'public', 'dashboard.html'), 'utf8'); } catch { dashboardHtml = '<h1>Dashboard not found</h1>'; }
+
+function handleDashboard(req, res) {
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(dashboardHtml);
+}
+
+function handleApiStatus(req, res) {
+  jsonRes(res, 200, {
+    uptime: Math.floor((Date.now() - startTime) / 1000),
+    port: CFG.port,
+    host: CFG.host,
+    api: CFG.api_base,
+    cc_version: CC_VERSION,
+    proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port}` : 'off',
+    key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none',
+  });
+}
+
+function handleApiUsage(req, res) {
+  jsonRes(res, 200, getUsageSummary());
+}
+
+function handleApiLogs(req, res) {
+  const n = parseInt(new URL(req.url, `http://${req.headers.host}`).searchParams.get('n') || '100');
+  jsonRes(res, 200, { logs: logBuffer.slice(-n) });
+}
+
+function handleApiModels(req, res) {
+  const freeModels = (cachedModels || []).filter(m => /free/i.test(m.id));
+  jsonRes(res, 200, { models: freeModels, total: freeModels.length, all_count: (cachedModels || []).length });
+}
+
+async function handleApiTest(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
+  const model = body.model;
+  if (!model) return jsonRes(res, 400, { error: 'Missing model' });
+  const apiKey = CFG.api_key;
+  if (!apiKey) return jsonRes(res, 400, { error: 'No API key configured' });
+
+  const start = Date.now();
+  const TIMEOUT_MS = 30000;
+  try {
+    // Use stream: true to match what buildCcRequest sends
+    const testBody = buildCcRequest({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5, stream: true });
+    const ccRes = await forwardToCC(testBody, apiKey);
+    if (!ccRes.ok) {
+      const errText = await ccRes.text().catch(() => '');
+      return jsonRes(res, 200, { ok: false, model, status: ccRes.status, ms: Date.now() - start, error: errText.slice(0, 200) });
+    }
+    // Read streaming NDJSON, stop on 'finish' event or timeout
+    const reader = ccRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let resultText = '';
+    let finished = false;
+    const deadline = Date.now() + TIMEOUT_MS;
+    while (!finished && Date.now() < deadline) {
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), deadline - Date.now()))
+      ]);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === 'text-delta') resultText += ev.text || '';
+          if (ev.type === 'error') resultText += `[ERROR: ${ev.error?.message || 'unknown'}]`;
+          if (ev.type === 'finish-step') {
+            const u = ev.usage || {};
+            recordTokens(model, u.inputTokens || 0, u.outputTokens || 0);
+          }
+          if (ev.type === 'finish') finished = true;
+        } catch {}
+      }
+    }
+    reader.cancel().catch(() => {});
+    jsonRes(res, 200, { ok: true, model, status: 200, ms: Date.now() - start, response: resultText.slice(0, 200) });
+  } catch (e) {
+    jsonRes(res, 200, { ok: false, model, status: 0, ms: Date.now() - start, error: e.message });
+  }
+}
+
 const startTime = Date.now();
 
 const server = http.createServer(async (req, res) => {
@@ -1203,8 +1373,16 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   try {
+    // Dashboard routes
+    if (url.pathname === '/' && req.method === 'GET') return handleDashboard(req, res);
+    if (url.pathname === '/api/status' && req.method === 'GET') return handleApiStatus(req, res);
+    if (url.pathname === '/api/usage' && req.method === 'GET') return handleApiUsage(req, res);
+    if (url.pathname === '/api/logs' && req.method === 'GET') return handleApiLogs(req, res);
+    if (url.pathname === '/api/models' && req.method === 'GET') return handleApiModels(req, res);
+    if (url.pathname === '/api/test' && req.method === 'POST') return handleApiTest(req, res);
+
+    // Gateway routes
     if (url.pathname === '/health' && req.method === 'GET') return handleHealth(req, res);
-    if (url.pathname === '/' && req.method === 'GET') return handleRoot(req, res);
     if (url.pathname === '/v1/models' && req.method === 'GET') return handleModels(req, res);
     if (url.pathname === '/v1/chat/completions' && req.method === 'POST') return handleChatCompletions(req, res);
     if (url.pathname === '/v1/messages' && req.method === 'POST') return handleMessages(req, res);
@@ -1217,11 +1395,31 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ── Global Error Handlers (prevent process crash) ──────────────────────
+process.on('uncaughtException', (err) => {
+  log('error', `[FATAL] uncaughtException: ${err.message}`);
+  if (err.stack) log('error', err.stack);
+  // Don't exit — keep the server alive
+});
+
+process.on('unhandledRejection', (reason) => {
+  log('error', `[FATAL] unhandledRejection: ${reason?.message || reason}`);
+  if (reason?.stack) log('error', reason.stack);
+  // Don't exit — keep the server alive
+});
+
+server.on('error', (err) => {
+  log('error', `Server error: ${err.message}`);
+});
+
 // ── Start ───────────────────────────────────────────────────────────────────
 
 async function start() {
   // Ensure config exists
   if (!fs.existsSync(CONFIG_PATH)) saveConfig(CFG);
+
+  // Load persisted token usage
+  loadUsage();
 
   // Refresh CC version + model list
   await refreshCcVersion();

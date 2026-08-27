@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cc-gateway · 管理面板</title>
+<style>
+:root{--bg:#f4f6fa;--card:#ffffff;--border:#dde3ec;--text:#1f2937;--dim:#6b7280;--accent:#2f6bff;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--mono:ui-monospace,Consolas,"Microsoft YaHei",monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,"Microsoft YaHei",sans-serif;padding:28px;font-size:15px;line-height:1.6}
+h1{font-size:26px;margin-bottom:6px}
+h2{font-size:18px;color:var(--accent);margin:28px 0 12px;font-weight:600}
+h2 .tag{font-size:12px;color:var(--dim);font-weight:400;margin-left:8px}
+.sub{color:var(--dim);font-size:14px;margin-bottom:20px}
+.container{max-width:1200px;margin:0 auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 18px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.card .k{font-size:13px;color:var(--dim);margin-bottom:6px}
+.card .v{font-size:21px;font-weight:700;word-break:break-all}
+.card .v.sm{font-size:15px;font-weight:600}
+table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:14px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+th,td{padding:10px 14px;text-align:left;border-bottom:1px solid var(--border);vertical-align:middle}
+th{color:var(--dim);font-weight:600;font-size:13px;background:#fafbfd}
+tr:last-child td{border-bottom:none}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.ok{background:#dcfce7;color:var(--ok)}.warn{background:#fef3c7;color:var(--warn)}.bad{background:#fee2e2;color:var(--bad)}
+button{background:var(--accent);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s}
+button:hover{opacity:.85}
+button.ghost{background:#fff;border:1px solid var(--border);color:var(--text)}
+.copy-btn{background:#fff;border:1px solid var(--border);color:var(--dim);border-radius:6px;padding:2px 9px;font-size:11px;cursor:pointer;margin-left:8px;vertical-align:middle;transition:all .15s}
+.copy-btn:hover{border-color:var(--accent);color:var(--accent)}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:18px 20px;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+.logs{background:#0f172a;border-radius:12px;padding:13px 15px;font-family:var(--mono);font-size:12.5px;max-height:350px;overflow-y:auto;line-height:1.8;color:#c7d2fe}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grow{flex:1}
+.model-card{display:flex;flex-direction:column}
+.model-card .top{display:flex;align-items:flex-start;justify-content:space-between;gap:9px}
+.model-card .top button{flex-shrink:0;white-space:nowrap;padding:6px 12px}
+.model-name{font-size:13px;font-weight:600;word-break:break-all;font-family:var(--mono)}
+.model-info{min-height:40px}
+.test-slot{margin-top:auto;padding-top:10px;min-height:34px;display:flex;align-items:center}
+.ts-badge{display:inline-block;padding:4px 12px;border-radius:8px;font-size:12.5px;font-weight:600;background:#f1f5f9;color:var(--dim);border:1px solid var(--border)}
+.ts-badge.ok{background:#dcfce7;color:var(--ok);border-color:#bbf7d0}
+.ts-badge.bad{background:#fee2e2;color:var(--bad);border-color:#fecaca}
+.ts-badge.queued{background:#fef3c7;color:var(--warn);border-color:#fde68a}
+.ts-badge.running{background:#dbeafe;color:var(--accent);border-color:#bfdbfe}
+.bar{height:6px;border-radius:999px;background:#e5e9f0;overflow:hidden;margin-top:4px}
+.bar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--accent),#7c3aed)}
+#toast{position:fixed;top:22px;left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;align-items:center;gap:8px;pointer-events:none}
+#toast .t{background:var(--card);border:1px solid var(--border);border-left:4px solid var(--accent);border-radius:10px;padding:10px 18px;font-size:14px;font-weight:600;box-shadow:0 6px 20px rgba(15,23,42,.14);animation:tIn .22s ease}
+#toast .t.ok{border-left-color:var(--ok)}
+#toast .t.warn{border-left-color:var(--warn)}
+#toast .t.bad{border-left-color:var(--bad)}
+@keyframes tIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
+.auto-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:#dbeafe;color:var(--accent);margin-left:8px}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>cc-gateway</h1>
+<div class="sub">Command Code CLI → 标准 API 网关 · OpenAI / Anthropic / Responses · SOCKS5 代理 · 自动重试 · Free 模型自动测试</div>
+
+<!-- 接入地址 -->
+<div class="panel" style="margin-bottom:14px">
+  <div style="font-size:13px;font-weight:700;margin-bottom:8px">接入地址 <span style="font-weight:400;color:var(--dim)">（点复制按钮一键复制）</span></div>
+  <table>
+    <thead><tr><th style="width:190px">用途</th><th>地址</th><th style="width:130px">密钥</th></tr></thead>
+    <tbody id="endpoints"></tbody>
+  </table>
+</div>
+
+<!-- 状态总览 -->
+<h2>状态总览</h2>
+<div class="cards" id="overview" style="grid-template-columns:repeat(4,1fr)"></div>
+
+<!-- Free 模型测试 -->
+<h2>Free 模型测试 <span class="tag">自动从上游模型表筛选含 free 标签的模型，逐个发 ping 测试</span></h2>
+<div class="row" style="margin-bottom:12px"><button id="btn-test-all">一键测试全部 Free 模型</button><span class="sub" id="test-all-status" style="margin:0"></span></div>
+<div class="cards" id="models"></div>
+
+<!-- 每日 Token 用量 -->
+<h2>今日 Token 用量 <span class="tag">实时更新，按模型分组统计</span></h2>
+<div class="cards" id="usage-cards" style="grid-template-columns:repeat(4,1fr);margin-bottom:12px"></div>
+<table id="usage-table">
+  <thead><tr><th>模型</th><th>请求数</th><th>输入 tokens</th><th>输出 tokens</th><th>总 tokens</th><th>占比</th></tr></thead>
+  <tbody></tbody>
+</table>
+
+<!-- 日志 -->
+<h2>网关日志 <span class="tag">最近 100 条日志，每 3 秒自动刷新</span></h2>
+<div class="logs" id="logs"></div>
+
+</div>
+
+<div id="toast"></div>
+
+<script>
+const $=(id)=>document.getElementById(id);
+const api=async(path,opt)=>{const r=await fetch(path,opt);return r.json()};
+
+function toast(msg,type="ok"){
+  const t=document.createElement("div");
+  t.className="t "+type;
+  t.textContent=msg;
+  $("toast").appendChild(t);
+  setTimeout(()=>{t.style.transition="opacity .35s";t.style.opacity="0";setTimeout(()=>t.remove(),380)},2400);
+}
+
+async function copyText(t){
+  try{await navigator.clipboard.writeText(t);toast("已复制: "+t,"ok")}
+  catch{toast("复制失败","bad")}
+}
+
+function uptimeStr(s){
+  s=Math.floor(s||0);
+  if(s<60)return s+" 秒";
+  if(s<3600)return Math.floor(s/60)+" 分钟";
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
+  return h+" 小时 "+(m<10?"0":"")+m+" 分钟";
+}
+
+function fmtTokens(n){
+  if(n>=1e6)return (n/1e6).toFixed(2)+"M";
+  if(n>=1e3)return (n/1e3).toFixed(1)+"K";
+  return String(n);
+}
+
+const time=(t)=>{const d=new Date(t);return d.toLocaleTimeString("zh-CN",{hour12:false})};
+
+// ---- Free model test ----
+const testResults={};
+let testQueue=[],testRunning=false;
+
+async function loadModels(){
+  const data=await api("/api/models");
+  const models=data.models||[];
+  if(!models.length){
+    $("models").innerHTML='<div class="card" style="grid-column:1/-1;text-align:center;color:var(--dim);padding:30px">暂无 Free 模型（共 '+data.all_count+' 个模型）</div>';
+    return;
+  }
+  $("models").innerHTML=models.map(m=>
+    `<div class="card model-card" data-model="${m.id}">
+      <div class="top"><span class="model-name">${m.id}</span><button class="ghost" onclick="testModel('${m.id}')">测试</button></div>
+      <div class="test-slot"><span class="ts-badge">${testResults[m.id]?testResults[m.id].text:"未检测"}</span></div>
+    </div>`
+  ).join("");
+  // Restore badges
+  models.forEach(m=>{if(testResults[m.id])updateSlot(m.id)});
+}
+
+async function testModel(m){
+  if(testResults[m]&&(testResults[m].queued||testResults[m].running))return;
+  testResults[m]={ok:null,queued:true,text:"待排队"};
+  updateSlot(m);
+  testQueue.push(m);
+  drainTestQueue();
+}
+
+async function drainTestQueue(){
+  if(testRunning||!testQueue.length)return;
+  testRunning=true;
+  const m=testQueue.shift();
+  testResults[m]={ok:null,running:true,text:"正在检测"};
+  updateSlot(m);
+  try{
+    const r=await api("/api/test",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({model:m})});
+    if(r.ok)testResults[m]={ok:true,text:`正常 (${r.ms}ms)`};
+    else if(r.status===429)testResults[m]={ok:false,status:429,text:"限流 429"};
+    else testResults[m]={ok:false,status:r.status,text:`失败 ${r.status||"超时"}`};
+  }catch(e){testResults[m]={ok:false,text:"检测异常"}}
+  updateSlot(m);
+  testRunning=false;
+  const done=(testResults.__allModels||[]).filter(m=>testResults[m]&&!testResults[m].queued&&!testResults[m].running);
+  if(done.length){
+    const ok=done.filter(m=>testResults[m].ok).length;
+    const fail=done.filter(m=>!testResults[m].ok).length;
+    $("test-all-status").textContent=`测试完成：${ok} 个正常，${fail} 个异常`;
+  }
+  if(testQueue.length)await new Promise(r=>setTimeout(r,1500));
+  drainTestQueue();
+}
+
+function updateSlot(m){
+  const card=document.querySelector(`.model-card[data-model="${m}"]`);
+  if(!card)return;
+  const badge=card.querySelector(".ts-badge");
+  const tr=testResults[m];
+  if(!tr){badge.textContent="未检测";badge.className="ts-badge";return}
+  badge.textContent=tr.text;
+  badge.className="ts-badge";
+  if(tr.ok)badge.classList.add("ok");
+  else if(tr.queued)badge.classList.add("queued");
+  else if(tr.running)badge.classList.add("running");
+  else badge.classList.add("bad");
+}
+
+$("btn-test-all").onclick=async()=>{
+  const data=await api("/api/models");
+  const models=data.models||[];
+  testResults.__allModels=models.map(m=>m.id);
+  $("test-all-status").textContent=`正在排队测试 ${models.length} 个模型…`;
+  models.forEach((m,i)=>setTimeout(()=>testModel(m.id),i*2000));
+};
+
+// ---- Usage ----
+async function refreshUsage(){
+  const u=await api("/api/usage");
+  const total=u.total||{input:0,output:0,requests:0,tokens:0};
+  $("usage-cards").innerHTML=`
+    <div class="card"><div class="k">今日总请求</div><div class="v">${total.requests}</div></div>
+    <div class="card"><div class="k">输入 Tokens</div><div class="v">${fmtTokens(total.input)}</div></div>
+    <div class="card"><div class="k">输出 Tokens</div><div class="v">${fmtTokens(total.output)}</div></div>
+    <div class="card"><div class="k">总 Tokens</div><div class="v">${fmtTokens(total.tokens)}</div></div>`;
+  const models=u.models||[];
+  const tbody=$("usage-table").querySelector("tbody");
+  if(!models.length){
+    tbody.innerHTML='<tr><td colspan="6" style="color:var(--dim)">今日暂无请求</td></tr>';
+    return;
+  }
+  tbody.innerHTML=models.map(m=>{
+    const pct=total.tokens>0?((m.input+m.output)/total.tokens*100).toFixed(1):"0";
+    return `<tr>
+      <td style="font-family:var(--mono)">${m.model}</td>
+      <td>${m.requests}</td>
+      <td style="font-family:var(--mono)">${fmtTokens(m.input)}</td>
+      <td style="font-family:var(--mono)">${fmtTokens(m.output)}</td>
+      <td style="font-family:var(--mono)"><b>${fmtTokens(m.input+m.output)}</b></td>
+      <td style="min-width:120px"><div class="bar"><i style="width:${pct}%"></div><span style="font-size:12px;color:var(--dim)">${pct}%</span></td>
+    </tr>`;
+  }).join("");
+}
+
+// ---- Logs ----
+async function refreshLogs(){
+  const data=await api("/api/logs?n=100");
+  const logs=data.logs||[];
+  $("logs").innerHTML=logs.reverse().map(l=>{
+    const color=l.level==="error"?"#fca5a5":l.level==="warn"?"#fcd34d":"#c7d2fe";
+    return `<div style="color:${color}">[${time(l.ts)}] [${l.level}] ${l.msg}</div>`;
+  }).join("")||'<div style="color:var(--dim)">暂无日志</div>';
+}
+
+// ---- Status & Endpoints ----
+async function refreshStatus(){
+  const s=await api("/api/status");
+  $("overview").innerHTML=`
+    <div class="card"><div class="k">上游</div><div class="v sm">${s.api}</div></div>
+    <div class="card"><div class="k">运行时长</div><div class="v sm">${uptimeStr(s.uptime)}</div></div>
+    <div class="card"><div class="k">CC 版本</div><div class="v sm">${s.cc_version}</div></div>
+    <div class="card"><div class="k">代理</div><div class="v sm">${s.proxy}</div></div>`;
+  const base=`http://${s.host==="0.0.0.0"?"127.0.0.1":s.host}:${s.port}`;
+  $("endpoints").innerHTML=`
+    <tr><td>管理面板</td><td style="font-family:var(--mono);word-break:break-all">${base}/<button class="copy-btn" onclick="copyText('${base}/')">复制</button></td><td style="font-family:var(--mono)">—</td></tr>
+    <tr><td>OpenAI 兼容（Chat / Responses）<br><span style="color:var(--dim);font-size:12px">opencode / Hermes / Codex / Cline 等</span></td><td style="font-family:var(--mono);word-break:break-all">${base}/v1<button class="copy-btn" onclick="copyText('${base}/v1')">复制</button></td><td style="font-family:var(--mono)">${s.key}<button class="copy-btn" onclick="copyText('${s.key}')">复制</button></td></tr>
+    <tr><td>Anthropic 兼容（Messages）<br><span style="color:var(--dim);font-size:12px">Claude Code</span></td><td style="font-family:var(--mono);word-break:break-all">${base}<button class="copy-btn" onclick="copyText('${base}')">复制</button></td><td style="font-family:var(--mono)">${s.key}<button class="copy-btn" onclick="copyText('${s.key}')">复制</button></td></tr>`;
+}
+
+// ---- Main refresh loop ----
+async function refresh(){
+  await Promise.all([refreshStatus(),refreshUsage(),refreshLogs()]);
+}
+
+refresh();
+setInterval(refresh,3000);
+
+// Auto-load models on first load
+setTimeout(async()=>{
+  await loadModels();
+  // Auto-test if no results yet
+  if(!Object.keys(testResults).filter(k=>k!=="__allModels").length){
+    const data=await api("/api/models");
+    if(data.models&&data.models.length)$("btn-test-all").click();
+  }
+},1000);
+</script>
+</body>
+</html>
