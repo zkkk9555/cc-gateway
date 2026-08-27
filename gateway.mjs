@@ -397,15 +397,13 @@ function detectClient(req, body) {
     try {
       const parsed = typeof body === 'string' ? JSON.parse(body) : body;
 
-      // Hermes: developer role + many tools (8+)
-      if (parsed.messages?.some(m => m.role === 'developer')) {
-        const toolCount = parsed.tools?.length || 0;
-        if (toolCount >= 8) return 'hermes';
-        return 'hermes-lite'; // developer role but few tools
+      // Hermes: developer role message OR reasoning_effort parameter
+      if (parsed.messages?.some(m => m.role === 'developer') || parsed.reasoning_effort) {
+        return 'hermes';
       }
 
       // OpenCode: Chat Completions with tools but no developer role
-      if (parsed.tools?.length > 0 && !parsed.messages?.some(m => m.role === 'developer')) {
+      if (parsed.tools?.length > 0) {
         return 'opencode';
       }
     } catch {}
@@ -516,6 +514,7 @@ function buildCcRequest(openaiReq) {
     if (msg.role === 'tool') {
       const toolCallId = msg.tool_call_id || '';
       const toolName = toolNameMap[toolCallId] || msg.name || '';
+      if (!toolName) log('warn', `Tool result with unknown tool_call_id: ${toolCallId} (name=${msg.name || 'none'})`);
       const output = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content || '');
       return { role: 'tool', content: [{ type: 'tool-result', toolCallId, toolName, output: { type: 'text', value: output } }] };
     }
@@ -988,6 +987,13 @@ async function handleChatCompletions(req, res) {
         lastError = earlyError;
         reader.cancel().catch(() => {});
         continue;
+      }
+
+      // All retries exhausted → return proper error
+      if (earlyError) {
+        log('error', `All retries exhausted for ${model}: ${earlyError.slice(0, 200)}`);
+        reader.cancel().catch(() => {});
+        return jsonRes(res, 503, { error: { message: earlyError.replace('[ERROR: ', '').replace(']', ''), type: 'proxy_error' } });
       }
 
       // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
