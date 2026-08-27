@@ -752,32 +752,52 @@ function convertResponsesToOpenai(responsesReq) {
 // ── Forward to CC API ───────────────────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, signal) {
-  // Use SOCKS5 proxy if configured (bypasses CC's proxy detection)
-  if (CFG.proxy?.enabled) {
-    return forwardToCCViaProxy(body, apiKey, signal);
+  const MAX_CC_RETRIES = 2;
+  const RETRY_DELAY = 1500;
+  let lastErr = null;
+
+  for (let attempt = 0; attempt <= MAX_CC_RETRIES; attempt++) {
+    if (attempt > 0) {
+      log('info', `CC reconnect ${attempt}/${MAX_CC_RETRIES}`);
+      await new Promise(r => setTimeout(r, RETRY_DELAY));
+    }
+    try {
+      let res;
+      if (CFG.proxy?.enabled) {
+        res = await forwardToCCViaProxy(body, apiKey, signal);
+      } else {
+        const sessionId = getSessionId(apiKey);
+        await ensureInitialized(apiKey);
+        res = await fetchWithTimeout(`${CFG.api_base}/alpha/generate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'x-cli-environment': 'production',
+            'x-command-code-version': CC_VERSION,
+            'x-session-id': sessionId,
+            'x-co-flag': 'false',
+            'x-taste-learning': 'false',
+            'x-project-slug': fakeProjectSlug(sessionId),
+            'traceparent': generateTraceparent(),
+          },
+          body: JSON.stringify(body),
+        }, 120000);
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      // Retry on connection-level errors (proxy disconnect, timeout, etc.)
+      const retryable = e.message?.includes('Connection closed') ||
+                         e.message?.includes('SOCKS5') ||
+                         e.message?.includes('timeout') ||
+                         e.message?.includes('ECONNRESET') ||
+                         e.message?.includes('socket hang up');
+      if (!retryable || attempt >= MAX_CC_RETRIES) throw e;
+      log('warn', `CC connection error (retryable): ${e.message}`);
+    }
   }
-
-  // Direct connection (original path)
-  const sessionId = getSessionId(apiKey);
-  await ensureInitialized(apiKey);
-
-  const res = await fetchWithTimeout(`${CFG.api_base}/alpha/generate`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${apiKey}`,
-      'x-cli-environment': 'production',
-      'x-command-code-version': CC_VERSION,
-      'x-session-id': sessionId,
-      'x-co-flag': 'false',
-      'x-taste-learning': 'false',
-      'x-project-slug': fakeProjectSlug(sessionId),
-      'traceparent': generateTraceparent(),
-    },
-    body: JSON.stringify(body),
-  }, 120000);
-
-  return res;
+  throw lastErr;
 }
 
 // ── SSE Response Helpers ────────────────────────────────────────────────────
