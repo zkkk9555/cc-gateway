@@ -1076,6 +1076,36 @@ async function handleChatCompletions(req, res) {
       }
 
       // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
+      if (openaiReq.stream === false) {
+        // Non-streaming: collect all chunks and return JSON
+        let fullText = '';
+        let inputTokens = 0, outputTokens = 0, finishReason = 'stop';
+        for (const chunk of preHeadersChunks) {
+          const delta = chunk.choices?.[0]?.delta;
+          if (delta?.content) fullText += delta.content;
+          if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+          if (chunk.usage) { inputTokens = chunk.usage.prompt_tokens || 0; outputTokens = chunk.usage.completion_tokens || 0; }
+        }
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          const chunks = translate(lines);
+          for (const chunk of chunks) {
+            const delta = chunk.choices?.[0]?.delta;
+            if (delta?.content) fullText += delta.content;
+            if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+            if (chunk.usage) { inputTokens = chunk.usage.prompt_tokens || 0; outputTokens = chunk.usage.completion_tokens || 0; }
+          }
+        }
+        return jsonRes(res, 200, {
+          id: completionId, object: 'chat.completion', created: nowUnix(), model,
+          choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: finishReason }],
+          usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+        });
+      }
       sseHeaders(res);
       for (const chunk of preHeadersChunks) sseData(res, chunk);
 
@@ -1129,6 +1159,33 @@ async function handleMessages(req, res) {
       return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) || `CC API error: ${ccRes.status}` } });
     }
 
+    // Non-streaming: collect all and return JSON
+    if (anthropicReq.stream === false) {
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === 'text-delta' || ev.type === 'reasoning-delta') fullText += ev.text || '';
+            if (ev.type === 'finish-step') { inputTokens = ev.usage?.inputTokens || 0; outputTokens = ev.usage?.outputTokens || 0; }
+          } catch {}
+        }
+      }
+      return jsonRes(res, 200, {
+        id: messageId, type: 'message', role: 'assistant', content: [{ type: 'text', text: fullText }],
+        model, stop_reason: 'end_turn', stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      });
+    }
+
     sseHeaders(res);
     const { translate, finalize } = createAnthropicTranslator(messageId, model);
     const reader = ccRes.body.getReader();
@@ -1177,6 +1234,33 @@ async function handleResponses(req, res) {
       const errText = await ccRes.text().catch(() => '');
       log('error', `CC error: ${ccRes.status}`);
       return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message: errText.slice(0, 500) || `CC API error: ${ccRes.status}`, type: 'proxy_error' } });
+    }
+
+    // Non-streaming: collect all and return JSON
+    if (responsesReq.stream === false) {
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === 'text-delta' || ev.type === 'reasoning-delta') fullText += ev.text || '';
+            if (ev.type === 'finish-step') { inputTokens = ev.usage?.inputTokens || 0; outputTokens = ev.usage?.outputTokens || 0; }
+          } catch {}
+        }
+      }
+      return jsonRes(res, 200, {
+        id: responseId, object: 'response', status: 'completed', model,
+        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullText }] }],
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+      });
     }
 
     sseHeaders(res);
