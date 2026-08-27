@@ -81,11 +81,38 @@ if (args.includes('--delete-key')) {
 const LOG_LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
 const minLevel = LOG_LEVELS[CFG.log_level] ?? 1;
 
+// ── Log File Persistence ───────────────────────────────────────────────────
+
+const LOG_DIR = path.join(__dirname, 'logs');
+let logStream = null;
+let logFileDate = '';
+
+function getLogFile() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== logFileDate) {
+    if (logStream) { try { logStream.end(); } catch {} }
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+    logStream = fs.createWriteStream(path.join(LOG_DIR, `gateway-${today}.log`), { flags: 'a' });
+    logFileDate = today;
+  }
+  return logStream;
+}
+
 function log(level, msg, data) {
   if ((LOG_LEVELS[level] ?? 1) < minLevel) return;
   const ts = new Date().toISOString();
   const extra = data ? ' ' + JSON.stringify(data) : '';
-  console.error(`[${ts}] [${level}] ${msg}${extra}`);
+  const line = `[${ts}] [${level}] ${msg}${extra}`;
+  console.error(line);
+  try { getLogFile().write(line + '\n'); } catch {}
+}
+
+function logError(msg, error) {
+  const ts = new Date().toISOString();
+  const stack = error?.stack || error?.message || String(error);
+  const line = `[${ts}] [error] ${msg}\n${stack}`;
+  console.error(line);
+  try { getLogFile().write(line + '\n'); } catch {}
 }
 
 // ── Fingerprint ─────────────────────────────────────────────────────────────
@@ -865,7 +892,7 @@ async function handleChatCompletions(req, res) {
   if (!apiKey) return jsonRes(res, 401, { error: { message: 'Missing API key', type: 'auth_error' } });
 
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
-  const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
+  let completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const ccBody = buildCcRequest(openaiReq);
   log('info', `Request: ${model} /v1/chat/completions`);
   log('debug', `Request body`, { model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
@@ -954,7 +981,7 @@ async function handleChatCompletions(req, res) {
     log('error', `All ${MAX_RETRIES} retries exhausted for ${model}: ${lastError}`);
     if (!res.headersSent) jsonRes(res, 503, { error: { message: lastError || 'Service temporarily unavailable after retries', type: 'proxy_error' } });
   } catch (e) {
-    log('error', `Request error: ${e.message}`);
+    logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else res.end();
   }
@@ -1003,7 +1030,7 @@ async function handleMessages(req, res) {
     for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
     res.end();
   } catch (e) {
-    log('error', `Request error: ${e.message}`);
+    logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
     else res.end();
   }
@@ -1052,7 +1079,7 @@ async function handleResponses(req, res) {
     for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
     res.end();
   } catch (e) {
-    log('error', `Request error: ${e.message}`);
+    logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else res.end();
   }
