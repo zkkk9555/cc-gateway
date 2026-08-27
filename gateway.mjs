@@ -1103,7 +1103,7 @@ async function handleChatCompletions(req, res) {
       }
 
       // Transient error before any real content → retry
-      if (earlyError && attempt < MAX_RETRIES) {
+      if (earlyError) {
         log('warn', `Transient error on ${model}, retrying: ${earlyError.slice(0, 100)}`);
         lastError = earlyError;
         reader.cancel().catch(() => {});
@@ -1184,7 +1184,7 @@ async function handleChatCompletions(req, res) {
       return;
     }
 
-    log('error', `All ${MAX_RETRIES} retries exhausted for ${model}: ${lastError}`);
+    log('error', `Retry deadline reached for ${model}: ${lastError}`);
     if (!res.headersSent) jsonRes(res, 503, { error: { message: lastError || 'Service temporarily unavailable after retries', type: 'proxy_error' } });
   } catch (e) {
     logError(`Request error: ${e.message}`, e);
