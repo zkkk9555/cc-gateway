@@ -247,7 +247,8 @@ async function refreshStatus(){
     <div class="card"><div class="k">上游</div><div class="v sm">${s.api}</div></div>
     <div class="card"><div class="k">运行时长</div><div class="v sm">${uptimeStr(s.uptime)}</div></div>
     <div class="card"><div class="k">CC 版本</div><div class="v sm">${s.cc_version}</div></div>
-    <div class="card"><div class="k">代理</div><div class="v sm">${s.proxy}</div></div>`;
+    <div class="card"><div class="k">代理</div><div class="v sm">${s.proxy}</div></div>
+    <div class="card"><div class="k">Key 池</div><div class="v sm">${s.key_pool?s.key_pool.healthy+"/"+s.key_pool.total+" 可用":"—"}${(s.key_pool&&s.key_pool.keys||[]).map(k=>`<span class="badge ${k.status==="ok"?"ok":k.status==="cooldown"?"warn":"bad"}" style="margin-left:6px">${k.key.slice(0,9)} ${k.status==="ok"?"":k.status}</span>`).join("")}</div></div>`;
   const base=`http://${s.host==="0.0.0.0"?"127.0.0.1":s.host}:${s.port}`;
   $("endpoints").innerHTML=`
     <tr><td>管理面板</td><td style="font-family:var(--mono);word-break:break-all">${base}/<button class="copy-btn" onclick="copyText('${base}/')">复制</button></td><td style="font-family:var(--mono)">—</td></tr>

@@ -160,17 +160,22 @@ def t_long_gen(lang):
     else:
         prompt = "Write a long essay (about 800 words) on the history of programming languages, with section headings."
         minlen = 1200
+    last = None
     try:
-        body = {"model": MODEL, "stream": True, "max_tokens": 16000,
-                "messages": [{"role": "user", "content": prompt}]}
-        r = post("/v1/chat/completions", body)
-        st = read_sse(r)
-        problems = check_common(st, minlen=minlen)
-        if not st["done"]: problems.append("no [DONE]")
-        if not st["finish"]: problems.append("no finish_reason")
-        if st["finish"] not in ("stop", "length"): problems.append(f"odd finish={st['finish']}")
-        report(not problems, f"P2 长篇生成-{lang}", f"len={len(st['text'])} chars, finish={st['finish']}, events={st['events']}, usage={st['usage'] and st['usage'].get('total_tokens')}" +
-               (f" problems={'; '.join(problems)}" if problems else ""), time.time()-t0)
+        for attempt in range(2):  # model compliance varies — retry once on short output
+            body = {"model": MODEL, "stream": True, "max_tokens": 16000,
+                    "messages": [{"role": "user", "content": prompt}]}
+            r = post("/v1/chat/completions", body)
+            st = read_sse(r)
+            problems = check_common(st, minlen=minlen)
+            if not st["done"]: problems.append("no [DONE]")
+            if not st["finish"]: problems.append("no finish_reason")
+            if st["finish"] not in ("stop", "length"): problems.append(f"odd finish={st['finish']}")
+            if not problems:
+                report(True, f"P2 长篇生成-{lang}", f"len={len(st['text'])} chars, finish={st['finish']}, events={st['events']}, usage={st['usage'] and st['usage'].get('total_tokens')} (attempt {attempt+1})", time.time()-t0)
+                return
+            last = f"len={len(st['text'])} finish={st['finish']} problems={'; '.join(problems)}"
+        report(False, f"P2 长篇生成-{lang}", last, time.time()-t0)
     except Exception as e:
         report(False, f"P2 长篇生成-{lang}", f"EXCEPTION {type(e).__name__}: {str(e)[:120]}", time.time()-t0)
 

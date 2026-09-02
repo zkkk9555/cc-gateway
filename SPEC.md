@@ -54,13 +54,33 @@ C:\Project\cc-gateway\
 ## CLI 命令
 
 ```bash
-node gateway.mjs              # 启动网关
-node gateway.mjs --set-key    # 交互式设置 API Key
-node gateway.mjs --show-key   # 显示当前 Key（掩码）
-node gateway.mjs --delete-key # 删除 API Key
-node gateway.mjs --version    # 显示版本
-node gateway.mjs --help       # 显示帮助
+node gateway.mjs                    # 启动网关
+node gateway.mjs --set-key          # 交互式设置主 API Key
+node gateway.mjs --add-key user_xxx # 向 Key 池追加 Key
+node gateway.mjs --remove-key user_xxx  # 从 Key 池移除 Key
+node gateway.mjs --list-keys        # 列出池内 Key（掩码）
+node gateway.mjs --show-key         # 显示主 Key（掩码）
+node gateway.mjs --delete-key       # 删除主 API Key
+node gateway.mjs --version          # 显示版本
+node gateway.mjs --help             # 显示帮助
 ```
+
+## API Key 池（v1.029）
+
+config.json 支持多 Key 聚合（类似 New API / sub2api 的 key 池）：
+
+```json
+{ "api_key": "user_主key", "api_keys": ["user_追加1", "user_追加2"] }
+```
+
+- **生效池** = `api_key` + `api_keys` 去重（两者都兼容，单 key 场景行为不变）
+- **轮询分发**：每个新请求取下一个健康 key（容量摊薄，避免单 key 打到限流）
+- **请求内故障转移**：某 key 出现 401（摘除）/ 403（套餐不含该模型，换 key 再试）/ 429（冷却 60s）/ 5xx / 连接失败 / 流内瞬态错误时，同一请求自动换下一个 key 重试，下游全程无感，仍在 120 秒窗口内
+- **403 逐 key 尝试**：套餐差异是 key 级的——key A 没有 muse-spark、key B 有时，请求会自动落在 B 上；全部 key 都 403 才返回 403
+- **健康标记**：429 → 冷却 60 秒（池内跳过）；401 → 直接摘除（重启恢复）；成功 → 清零故障计数
+- **客户端凭证规则**：下游 Agent 可以完全不带 key（走池）；带的 key 若在池内 → 入池轮询；带池外 key → 原样透传上游（保留个人 key 直连能力）
+- 每个 key 独立维护设备指纹与会话（`keyStates`/`sessions` 按 key 隔离），指纹预请求各自触发
+- `/api/status` 的 `key_pool` 字段与 dashboard「Key 池」卡片实时展示各 key 状态（ok / cooldown / disabled）
 
 ## API 端点
 

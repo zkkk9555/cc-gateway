@@ -24,22 +24,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.28
+  console.log(`cc-gateway v1.0.29
 Usage:
-  node gateway.mjs              Start the gateway
-  node gateway.mjs --set-key    Set API key interactively
-  node gateway.mjs --show-key   Show masked API key
-  node gateway.mjs --delete-key Delete stored API key
-  node gateway.mjs --version    Show version
-  node gateway.mjs --help       Show this help`);
+  node gateway.mjs                    Start the gateway
+  node gateway.mjs --set-key          Set primary API key interactively
+  node gateway.mjs --add-key user_xxx Add a key to the pool
+  node gateway.mjs --remove-key user_xxx  Remove a key from the pool
+  node gateway.mjs --list-keys        List pool keys (masked)
+  node gateway.mjs --show-key         Show masked primary API key
+  node gateway.mjs --delete-key       Delete primary API key
+  node gateway.mjs --version          Show version
+  node gateway.mjs --help             Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.28'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.29'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 }, stream_timeout_ms: 120000, reasoning_timeout_ms: 300000 };
+const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_keys: [], api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 }, stream_timeout_ms: 120000, reasoning_timeout_ms: 300000 };
 
 function loadConfig() {
   let cfg = { ...DEFAULT_CONFIG };
@@ -69,8 +72,35 @@ if (args.includes('--set-key')) {
   CFG.api_key = key; saveConfig(CFG);
   console.log('API Key saved.'); process.exit(0);
 }
+if (args.includes('--add-key')) {
+  const idx = args.indexOf('--add-key');
+  const key = idx >= 0 ? (args[idx + 1] || '').trim() : '';
+  if (!key.startsWith('user_')) { console.error('Error: Key must start with user_. Usage: node gateway.mjs --add-key user_xxx'); process.exit(1); }
+  if (!Array.isArray(CFG.api_keys)) CFG.api_keys = [];
+  if (!CFG.api_keys.includes(key)) CFG.api_keys.push(key);
+  if (!CFG.api_key) CFG.api_key = key;
+  saveConfig(CFG);
+  console.log(`Key added. Pool size: ${new Set([CFG.api_key, ...CFG.api_keys].filter(Boolean)).size}`);
+  process.exit(0);
+}
+if (args.includes('--remove-key')) {
+  const idx = args.indexOf('--remove-key');
+  const key = idx >= 0 ? (args[idx + 1] || '').trim() : '';
+  if (Array.isArray(CFG.api_keys)) {
+    CFG.api_keys = CFG.api_keys.filter(k => k !== key);
+    saveConfig(CFG);
+    console.log(`Key removed. Pool size: ${new Set([CFG.api_key, ...CFG.api_keys].filter(Boolean)).size}`);
+  } else console.log('No key pool configured.');
+  process.exit(0);
+}
+if (args.includes('--list-keys')) {
+  const pool = [...new Set([CFG.api_key, ...(Array.isArray(CFG.api_keys) ? CFG.api_keys : [])].filter(Boolean))];
+  if (!pool.length) { console.log('No keys configured. Use --set-key or --add-key.'); }
+  else pool.forEach((k, i) => console.log(`${i + 1}. ${k.slice(0, 8)}…${k.slice(-4)}`));
+  process.exit(0);
+}
 if (args.includes('--show-key')) {
-  console.log(CFG.api_key ? `Key: ${CFG.api_key.slice(0, 8)}…${CFG.api_key.slice(-4)}` : 'No key set.');
+  console.log(CFG.api_key ? `Primary Key: ${CFG.api_key.slice(0, 8)}…${CFG.api_key.slice(-4)}` : 'No key set.');
   process.exit(0);
 }
 if (args.includes('--delete-key')) {
@@ -266,6 +296,105 @@ function getSessionId(apiKey) {
   log('info', `Session created for ${apiKey.slice(0, 8)}`);
   return sessionId;
 }
+
+// ── API Key Pool ────────────────────────────────────────────────────────────
+// Aggregates multiple upstream keys (like New API / sub2api): round-robin
+// distribution for capacity, per-request failover so key-level failures are
+// invisible to downstream clients, 429 cooldown and auth-failure disabling.
+
+const KEY_COOLDOWN_MS = 60000; // after a 429, skip the key for 1 minute
+
+const keyPool = { keys: [], rr: 0, health: new Map() };
+
+function buildKeyPool() {
+  const list = [];
+  for (const k of [CFG.api_key, ...(Array.isArray(CFG.api_keys) ? CFG.api_keys : [])]) {
+    if (k && k.startsWith('user_') && !list.includes(k)) list.push(k);
+  }
+  keyPool.keys = list;
+  if (keyPool.rr >= list.length) keyPool.rr = 0;
+  for (const k of [...keyPool.health.keys()]) if (!list.includes(k)) keyPool.health.delete(k);
+  return list;
+}
+
+function keyHealth(key) {
+  let h = keyPool.health.get(key);
+  if (!h) { h = { disabled: false, cooldownUntil: 0, failures: 0, lastError: null }; keyPool.health.set(key, h); }
+  return h;
+}
+
+function poolNextKey() {
+  const n = keyPool.keys.length;
+  if (!n) return null;
+  // Pass 1: healthy keys only. Pass 2: allow cooling keys (better than failing
+  // when the whole pool is rate-limited). Disabled keys are never returned.
+  for (const allowCooling of [false, true]) {
+    for (let i = 0; i < n; i++) {
+      const idx = (keyPool.rr + i) % n;
+      const key = keyPool.keys[idx];
+      const h = keyHealth(key);
+      if (h.disabled) continue;
+      if (!allowCooling && Date.now() < h.cooldownUntil) continue;
+      keyPool.rr = (idx + 1) % n;
+      return key;
+    }
+  }
+  return null;
+}
+
+function poolActiveCount() { return keyPool.keys.filter(k => !keyHealth(k).disabled).length; }
+
+function poolPickAny() { return keyPool.keys.find(k => !keyHealth(k).disabled) || null; }
+
+function poolMarkSuccess(key) {
+  const h = keyHealth(key);
+  h.cooldownUntil = 0; h.failures = 0; h.lastError = null;
+}
+
+function poolCooldown(key, reason = 'rate_limited') {
+  const h = keyHealth(key);
+  h.cooldownUntil = Date.now() + KEY_COOLDOWN_MS;
+  h.failures++; h.lastError = reason;
+  log('warn', `Key ${key.slice(0, 8)}… cooling down ${KEY_COOLDOWN_MS / 1000}s (${reason})`);
+}
+
+function poolDisable(key, reason = 'auth_failed') {
+  const h = keyHealth(key);
+  h.disabled = true; h.failures++; h.lastError = reason;
+  log('error', `Key ${key.slice(0, 8)}… DISABLED from pool (${reason}). Restart or --remove-key to clear.`);
+}
+
+function poolStatus() {
+  return {
+    total: keyPool.keys.length,
+    healthy: poolActiveCount(),
+    keys: keyPool.keys.map(k => {
+      const h = keyHealth(k);
+      return {
+        key: `${k.slice(0, 8)}…${k.slice(-4)}`,
+        status: h.disabled ? 'disabled' : (Date.now() < h.cooldownUntil ? 'cooldown' : 'ok'),
+        failures: h.failures,
+        last_error: h.lastError,
+      };
+    }),
+  };
+}
+
+// Per-request key selector: first pick = round-robin (load distribution),
+// subsequent picks = failover to the next healthy key. A client-provided key
+// NOT present in the pool is passed through unchanged (power-user escape hatch).
+function createKeySelector(clientKey) {
+  const passthrough = !!(clientKey && !keyPool.keys.includes(clientKey));
+  return {
+    passthrough,
+    next() {
+      if (passthrough) return clientKey;
+      return poolNextKey();
+    },
+  };
+}
+
+buildKeyPool();
 
 // ── Initialization (Fingerprint + Lifecycle) ────────────────────────────────
 
@@ -618,7 +747,8 @@ function extractApiKey(headers) {
 }
 
 function getApiKey(headers) {
-  return extractApiKey(headers) || (CFG.api_key || null);
+  // Client-provided key only; config keys are served via the key pool
+  return extractApiKey(headers);
 }
 
 function baseHeaders(apiKey) {
@@ -1416,8 +1546,10 @@ async function handleChatCompletions(req, res) {
   let openaiReq;
   try { openaiReq = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } }); }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) return jsonRes(res, 401, { error: { message: 'Missing API key', type: 'auth_error' } });
+  const clientKey = getApiKey(req.headers);
+  if (!clientKey && !keyPool.keys.length) return jsonRes(res, 401, { error: { message: 'Missing API key', type: 'auth_error' } });
+  const keySelector = createKeySelector(clientKey);
+  const tried403 = new Set();
 
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   let completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
@@ -1439,11 +1571,15 @@ async function handleChatCompletions(req, res) {
       }
       attempt++;
 
+      const apiKey = keySelector.next();
+      if (!apiKey) return jsonRes(res, 401, { error: { message: 'All API keys in pool are disabled (auth failed). Check --list-keys / logs.', type: 'auth_error' } });
+
       let ccRes;
       try {
         ccRes = await forwardToCC(ccBody, apiKey);
       } catch (connErr) {
-        // Connection-level failure (SOCKS5/TLS/timeout) rides the same 120s window
+        // Connection-level failure (SOCKS5/TLS/timeout) rides the same 120s window,
+        // failing over to the next pool key each attempt
         if (Date.now() >= RETRY_DEADLINE) {
           log('error', `Connection failed after retry window for ${model}: ${connErr.message}`);
           return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${connErr.message}`, type: 'proxy_error' } });
@@ -1455,17 +1591,36 @@ async function handleChatCompletions(req, res) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
         log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (ccRes.status === 401) {
+          // Dead key — remove it from the pool and fail over transparently
+          if (keySelector.passthrough) return jsonRes(res, 401, { error: { message, type: 'auth_error', ...(code ? { code } : {}) } });
+          poolDisable(apiKey);
+          lastError = `[ERROR: ${message}]`;
+          continue;
+        }
+        if (ccRes.status === 403) {
+          // Plan errors (MODEL_NOT_IN_PLAN etc.) are key-specific — try the other
+          // keys once before giving up; another key's plan may include the model
+          tried403.add(apiKey);
+          if (tried403.size >= (keySelector.passthrough ? 1 : poolActiveCount())) {
+            return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
+          }
+          log('warn', `403 on key ${apiKey.slice(0, 8)}… for ${model}, failing over to next key`);
+          continue;
+        }
+        // Permanent status errors (400/404/422/...) — return immediately
         if (isPermanentHttpStatus(ccRes.status)) {
           return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
         }
-        // Transient upstream error (429 / 5xx) → retry within the deadline
+        // Transient upstream error (429 / 5xx) → failover + retry within the deadline
+        if (ccRes.status === 429) poolCooldown(apiKey);
         lastError = `[ERROR: ${message}]`;
         if (Date.now() >= RETRY_DEADLINE) {
           return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, type: 'proxy_error', ...(code ? { code } : {}) } });
         }
         continue;
       }
+      poolMarkSuccess(apiKey);
 
       const reader = ccRes.body.getReader();
       const decoder = new TextDecoder();
@@ -1619,8 +1774,10 @@ async function handleMessages(req, res) {
   let anthropicReq;
   try { anthropicReq = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body' } } }); }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) return jsonRes(res, 401, { error: { type: 'error', error: { type: 'authentication_error', message: 'Missing API key' } } });
+  const clientKey = getApiKey(req.headers);
+  if (!clientKey && !keyPool.keys.length) return jsonRes(res, 401, { error: { type: 'error', error: { type: 'authentication_error', message: 'Missing API key' } } });
+  const keySelector = createKeySelector(clientKey);
+  const tried403 = new Set();
 
   const model = anthropicReq.model || 'deepseek/deepseek-v4-flash';
   const messageId = `msg_${randomUUID().slice(0, 12)}`;
@@ -1637,6 +1794,9 @@ async function handleMessages(req, res) {
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/messages, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
+      const apiKey = keySelector.next();
+      if (!apiKey) return jsonRes(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'All API keys in pool are disabled (auth failed). Check --list-keys / logs.' } });
+
       let ccRes;
       try {
         ccRes = await forwardToCC(ccBody, apiKey);
@@ -1652,15 +1812,30 @@ async function handleMessages(req, res) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
         log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (ccRes.status === 401) {
+          if (keySelector.passthrough) return jsonRes(res, 401, { type: 'error', error: { type: 'authentication_error', message, ...(code ? { code } : {}) } });
+          poolDisable(apiKey);
+          continue;
+        }
+        if (ccRes.status === 403) {
+          tried403.add(apiKey);
+          if (tried403.size >= (keySelector.passthrough ? 1 : poolActiveCount())) {
+            return jsonRes(res, ccRes.status, { type: 'error', error: { type: 'api_error', message, ...(code ? { code } : {}) } });
+          }
+          log('warn', `403 on key ${apiKey.slice(0, 8)}… for ${model}, failing over to next key`);
+          continue;
+        }
+        // Permanent status errors (400/404/422/...) — return immediately
         if (isPermanentHttpStatus(ccRes.status)) {
           return jsonRes(res, ccRes.status, { type: 'error', error: { type: 'api_error', message, ...(code ? { code } : {}) } });
         }
+        if (ccRes.status === 429) poolCooldown(apiKey);
         if (Date.now() >= RETRY_DEADLINE) {
           return jsonRes(res, 503, { type: 'error', error: { type: 'api_error', message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, ...(code ? { code } : {}) } });
         }
         continue;
       }
+      poolMarkSuccess(apiKey);
 
       const reader = ccRes.body.getReader();
       const decoder = new TextDecoder();
@@ -1777,8 +1952,10 @@ async function handleResponses(req, res) {
   let responsesReq;
   try { responsesReq = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } }); }
 
-  const apiKey = getApiKey(req.headers);
-  if (!apiKey) return jsonRes(res, 401, { error: { message: 'Missing API key', type: 'auth_error' } });
+  const clientKey = getApiKey(req.headers);
+  if (!clientKey && !keyPool.keys.length) return jsonRes(res, 401, { error: { message: 'Missing API key', type: 'auth_error' } });
+  const keySelector = createKeySelector(clientKey);
+  const tried403 = new Set();
 
   const model = responsesReq.model || 'deepseek/deepseek-v4-flash';
   const responseId = `resp_${randomUUID().slice(0, 12)}`;
@@ -1795,6 +1972,9 @@ async function handleResponses(req, res) {
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/responses, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
+      const apiKey = keySelector.next();
+      if (!apiKey) return jsonRes(res, 401, { error: { message: 'All API keys in pool are disabled (auth failed). Check --list-keys / logs.', type: 'auth_error' } });
+
       let ccRes;
       try {
         ccRes = await forwardToCC(ccBody, apiKey);
@@ -1810,15 +1990,30 @@ async function handleResponses(req, res) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
         log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (ccRes.status === 401) {
+          if (keySelector.passthrough) return jsonRes(res, 401, { error: { message, type: 'auth_error', ...(code ? { code } : {}) } });
+          poolDisable(apiKey);
+          continue;
+        }
+        if (ccRes.status === 403) {
+          tried403.add(apiKey);
+          if (tried403.size >= (keySelector.passthrough ? 1 : poolActiveCount())) {
+            return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
+          }
+          log('warn', `403 on key ${apiKey.slice(0, 8)}… for ${model}, failing over to next key`);
+          continue;
+        }
+        // Permanent status errors (400/404/422/...) — return immediately
         if (isPermanentHttpStatus(ccRes.status)) {
           return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
         }
+        if (ccRes.status === 429) poolCooldown(apiKey);
         if (Date.now() >= RETRY_DEADLINE) {
           return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, type: 'proxy_error', ...(code ? { code } : {}) } });
         }
         continue;
       }
+      poolMarkSuccess(apiKey);
 
       const reader = ccRes.body.getReader();
       const decoder = new TextDecoder();
@@ -1938,7 +2133,7 @@ const MODELS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 async function refreshModels() {
   try {
-    const apiKey = CFG.api_key;
+    const apiKey = poolPickAny();
     if (!apiKey) return;
     const res = await fetchWithTimeout(`${CFG.api_base}/provider/v1/models`, {
       headers: { 'Authorization': `Bearer ${apiKey}` },
@@ -1975,11 +2170,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.28', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.29', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.28', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.29', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -2012,6 +2207,7 @@ function handleApiStatus(req, res) {
     cc_version: CC_VERSION,
     proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port}` : 'off',
     key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none',
+    key_pool: poolStatus(),
   });
 }
 
@@ -2034,7 +2230,7 @@ async function handleApiTest(req, res) {
   try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
   const model = body.model;
   if (!model) return jsonRes(res, 400, { error: 'Missing model' });
-  const apiKey = CFG.api_key;
+  const apiKey = poolPickAny();
   if (!apiKey) return jsonRes(res, 400, { error: 'No API key configured' });
 
   const start = Date.now();
@@ -2171,13 +2367,13 @@ async function start() {
   await refreshModels();
 
   server.listen(CFG.port, CFG.host, () => {
-    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
-    console.log(`\n  cc-gateway v1.0.28`);
+    log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key_pool: `${poolActiveCount()}/${keyPool.keys.length} healthy` });
+    console.log(`\n  cc-gateway v1.0.29`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
     console.log(`  Proxy: ${CFG.proxy?.enabled ? 'socks5://' + CFG.proxy.host + ':' + CFG.proxy.port : 'off'}`);
-    console.log(`  API Key: ${CFG.api_key ? CFG.api_key.slice(0, 8) + '…' : 'not set (pass via Authorization header)'}`);
+    console.log(`  API Key Pool: ${poolActiveCount()}/${keyPool.keys.length} healthy (round-robin + failover)`);
     console.log(`\n  Endpoints:`);
     console.log(`    POST /v1/chat/completions   (OpenAI)`);
     console.log(`    POST /v1/messages           (Anthropic)`);
