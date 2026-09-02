@@ -8,9 +8,18 @@
 
 ```
 C:\Project\cc-gateway\
-├── gateway.mjs          ← 唯一核心文件（~1500-2000行）
-├── config.json          ← 运行时配置（首次启动自动创建）
+├── gateway.mjs          ← 唯一核心文件（~1700行）
+├── config.json          ← 运行时配置（首次启动自动创建，不入库）
+├── config.json.example  ← 配置模板
 ├── package.json         ← npm metadata
+├── public/dashboard.html ← Web 管理面板（/ 路径）
+├── data/usage.json      ← token 用量持久化（不入库）
+├── logs/                ← 按天滚动日志（不入库）
+├── test_matrix.py       ← 3模型×3API模式 流式回归测试
+├── test_extra.py        ← 非流式/工具调用/错误清洗 回归测试
+├── test_stress.py       ← 压力测试
+├── test_aggressive.py   ← 激进压测
+├── 启动网关.bat / 停止网关.bat / restart.bat / start.bat / stop.bat
 ├── .gitignore
 └── SPEC.md              ← 本文件
 ```
@@ -29,9 +38,14 @@ C:\Project\cc-gateway\
   "host": "0.0.0.0",
   "api_key": "user_xxx",
   "api_base": "https://api.commandcode.ai",
-  "log_level": "info"
+  "log_level": "info",
+  "proxy": { "enabled": false, "host": "127.0.0.1", "port": 7897 },
+  "stream_timeout_ms": 120000
 }
 ```
+
+- `stream_timeout_ms`：流式传输中单次 `reader.read()` 的最大等待时间（毫秒），默认 120000（2 分钟）。推理型模型（如 `meta/muse-spark`）思考时可能长时间不发事件，需适当增大此值。
+- `reasoning_timeout_ms`：推理阶段（检测到 `reasoning-start` 后）的超时时间，默认 300000（5 分钟）。推理模型内部思考时不会发送中间事件，此值需大于模型最长推理时间。
 
 - 首次启动时自动创建默认 config.json
 - 支持环境变量覆写：`PORT`、`HOST`、`CC_API_KEY`、`CC_API_BASE`、`LOG_LEVEL`
@@ -264,27 +278,68 @@ data: {"type":"message_stop"}
 ```
 
 ### OpenAI Responses 响应
+
+标准 OpenAI Responses 流式事件序列（v1.025 起完全符合官方协议）：
+
 ```
 event: response.created
 data: {"type":"response.created","response":{...}}
 
-event: response.output_item.added
-data: {"type":"response.output_item.added","item":{...}}
+event: response.in_progress
+data: {"type":"response.in_progress","response":{...}}
 
-event: response.content_part.delta
-data: {"type":"response.content_part.delta","delta":{...}}
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","summary":[]}}   ← 推理模型先输出 reasoning item
+
+event: response.reasoning_summary_text.delta
+data: {"type":"response.reasoning_summary_text.delta","delta":"思考片段"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{...}}    ← reasoning item 完成
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":1,"item":{"type":"message","role":"assistant","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","part":{"type":"output_text","text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello"}
+
+event: response.output_text.done / response.content_part.done / response.output_item.done
 
 event: response.completed
-data: {"type":"response.completed","response":{...}}
+data: {"type":"response.completed","response":{...,"output":[全部 item],"usage":{...}}}
 ```
+
+工具调用使用 `function_call` item：`response.output_item.added`（type=function_call）→ `response.function_call_arguments.delta` → `response.function_call_arguments.done` → `response.output_item.done`。
+
+### 推理内容处理（v1.025）
+
+CC 的 `reasoning-delta` 事件按 API 格式分别输出，**绝不混入正文**：
+
+- Chat Completions → `delta.reasoning_content`（DeepSeek 风格字段）
+- Anthropic Messages → `thinking` content block（`thinking_delta` + 关块时 `signature_delta` 伪造签名，Claude Code 可正常显示）
+- Responses → 独立 `reasoning` item（`response.reasoning_summary_text.delta`）
+- 非流式路径：Chat 返回 `message.reasoning_content`，Anthropic 返回 thinking block，Responses 返回 reasoning item
+
+### 工具调用处理（v1.025）
+
+CC 上游可能以两种事件序列发出工具调用，翻译器两者都支持并按 toolCallId 去重：
+
+1. 增量式：`tool-input-start` → `tool-input-delta`（多次）→ `tool-input-end`
+2. 完整式：`tool-call`（一次性带全量 input）
+
+非流式路径由共享收集器 `collectCcStream()` 统一收集文本/推理/工具调用/用量。Responses 扁平工具定义 `{type:"function", name, parameters}` 正确映射 `parameters → input_schema`（v1.024 及之前此格式会退化成空 schema，导致模型无法传参）。
 
 ## 错误处理
 
-- CC 上游 429 → 映射为 OpenAI `rate_limit_error` / Anthropic `rate_limit_error`，带 `Retry-After` header
-- CC 上游 401/403 → 映射为认证错误
-- CC 上游 500+ → 映射为 `proxy_error`
+- CC 上游 **任何错误**（HTTP 429/5xx 或流内 `[ERROR: ...]`）→ 进入 **120 秒重试窗口**，不断重试直到成功或超时
+- CC 上游 401/403 → 立即返回认证错误（不重试，鉴权失败重试无意义）
 - 零输出 token → 返回 429（防止虚假计费）
-- 流式超时 30s / 非流式超时 90s
+- **流式超时**：`stream_timeout_ms`（默认120s）为正常超时；当检测到 `reasoning-start` 事件时，自动切换到 `reasoning_timeout_ms`（默认300s = 5分钟），推理结束后恢复。推理型模型（如 `meta/muse-spark`）内部思考时不发 NDJSON 事件，必须用更长超时。
+- 重试窗口耗尽仍失败 → 返回 503 `Service unavailable after N retries (120s)`
+- 上游错误体（如 `{"success":false,"error":{"code":"MODEL_NOT_IN_PLAN","message":"..."}}`）会被解析成干净的结构化错误返回（v1.025），`MODEL_NOT_IN_PLAN` 表示该模型不在当前套餐内（如 muse-spark-1.2 需 GOAT 套餐、1.1 需 Pro 套餐；`meta/muse-spark-1.2-contributor` 在普通套餐可用）
 
 ## 日志格式
 

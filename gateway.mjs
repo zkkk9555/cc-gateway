@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.0
+  console.log(`cc-gateway v1.0.25
 Usage:
   node gateway.mjs              Start the gateway
   node gateway.mjs --set-key    Set API key interactively
@@ -33,12 +33,12 @@ Usage:
   node gateway.mjs --help       Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.0'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.25'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 } };
+const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 }, stream_timeout_ms: 120000, reasoning_timeout_ms: 300000 };
 
 function loadConfig() {
   let cfg = { ...DEFAULT_CONFIG };
@@ -309,6 +309,29 @@ function fetchWithTimeout(url, opts = {}, timeoutMs = 60000) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
+// Parse a CC upstream error body into a clean message + code.
+// Upstream returns {"success":false,"error":{"code":"MODEL_NOT_IN_PLAN","message":"..."}} —
+// surface that readably instead of a raw JSON blob.
+function parseUpstreamError(errText, status) {
+  let message = `CC API error: ${status}`, code = null;
+  try {
+    const j = JSON.parse(errText);
+    const e = j.error || j;
+    if (e?.message) { message = e.message; code = e.code || j.code || null; }
+  } catch { if (errText && errText.trim()) message = errText.slice(0, 500); }
+  return { message, code };
+}
+
+// Fake signature for Anthropic thinking blocks. Anthropic validates signatures
+// cryptographically; third-party proxies cannot mint valid ones. Claude Code's
+// shallow check only requires base64 with payload first byte 0x12.
+// Derived from the thinking text so each block's signature differs.
+function fakeThinkingSignature(thinkingText) {
+  const seed = crypto.createHash('sha256').update(thinkingText || 'cc-gateway-thinking').digest().subarray(0, 64);
+  const raw = Buffer.concat([Buffer.from([0x12, seed.length]), seed]);
+  return raw.toString('base64');
 }
 
 // ── SOCKS5 Proxy Tunnel ────────────────────────────────────────────────────
@@ -611,7 +634,8 @@ function buildCcRequest(openaiReq) {
       type: t.type || 'function',
       name: t.function?.name || t.name || '',
       description: t.function?.description || t.description || '',
-      input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
+      // Chat: function.parameters; Anthropic: input_schema; Responses: flat parameters
+      input_schema: t.function?.parameters || t.input_schema || t.parameters || { type: 'object', properties: {} },
     }));
   }
   if (openaiReq.tool_choice !== undefined) {
@@ -619,7 +643,8 @@ function buildCcRequest(openaiReq) {
       const map = { auto: 'auto', none: 'none', required: 'any' };
       body.params.tool_choice = { type: map[openaiReq.tool_choice] || 'auto' };
     } else if (openaiReq.tool_choice.type === 'function') {
-      body.params.tool_choice = { type: 'tool', name: openaiReq.tool_choice.function?.name };
+      // Chat format: {type:"function", function:{name}}; Responses format: {type:"function", name}
+      body.params.tool_choice = { type: 'tool', name: openaiReq.tool_choice.function?.name || openaiReq.tool_choice.name };
     } else {
       body.params.tool_choice = openaiReq.tool_choice;
     }
@@ -718,7 +743,10 @@ function convertResponsesToOpenai(responsesReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (item.type === 'message') {
-        if (item.role === 'user') {
+        if (item.role === 'system' || item.role === 'developer') {
+          const text = Array.isArray(item.content) ? item.content.filter(c => c.type === 'input_text').map(c => c.text).join('') : String(item.content || '');
+          if (text) messages.push({ role: 'system', content: text });
+        } else if (item.role === 'user') {
           const text = (item.content || []).filter(c => c.type === 'input_text').map(c => c.text).join('');
           if (text) messages.push({ role: 'user', content: text });
         } else if (item.role === 'assistant') {
@@ -735,10 +763,11 @@ function convertResponsesToOpenai(responsesReq) {
       } else if (item.type === 'function_call_output') {
         messages.push({ role: 'tool', tool_call_id: item.call_id, content: String(item.output || '') });
       }
+      // Other item types (reasoning, etc.) are conversation history artifacts — skip
     }
   }
 
-  return {
+  const result = {
     model: responsesReq.model || 'deepseek/deepseek-v4-flash',
     messages,
     max_tokens: responsesReq.max_output_tokens || 64000,
@@ -747,6 +776,10 @@ function convertResponsesToOpenai(responsesReq) {
     tools: responsesReq.tools,
     tool_choice: responsesReq.tool_choice,
   };
+  // Responses API carries reasoning config as {reasoning: {effort: "..."}} (Codex sends this)
+  if (responsesReq.reasoning?.effort) result.reasoning_effort = responsesReq.reasoning.effort;
+
+  return result;
 }
 
 // ── Forward to CC API ───────────────────────────────────────────────────────
@@ -824,6 +857,85 @@ function readWithTimeout(reader, timeoutMs = 60000) {
   ]);
 }
 
+// Read a full CC NDJSON stream and collect text / reasoning / tool calls / usage.
+// Shared by the non-streaming paths of all three API formats (streaming paths use
+// the SSE translators instead). Same dual stream/reasoning timeout as streaming.
+async function collectCcStream(reader) {
+  const decoder = new TextDecoder();
+  let buffer = '', text = '', reasoning = '';
+  let inputTokens = 0, outputTokens = 0, finishReason = 'stop';
+  let inReasoning = false, timedOut = false;
+  const toolCalls = [];
+  const toolById = new Map();
+  let cur = null; // tool call being accumulated from tool-input-* events
+
+  const addTool = (id, name, args) => {
+    if (id && toolById.has(id)) return; // complete tool-call after incremental events
+    if (id) toolById.set(id, true);
+    toolCalls.push({ id: id || `call_${randomUUID().slice(0, 8)}`, name: name || '', arguments: args || '' });
+  };
+
+  try {
+    while (true) {
+      const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+      const { done, value } = await readWithTimeout(reader, timeoutMs);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let ev; try { ev = JSON.parse(line); } catch { continue; }
+        switch (ev.type || '') {
+          case 'text-delta': text += ev.text || ''; break;
+          case 'reasoning-delta': reasoning += ev.text || ''; break;
+          case 'reasoning-start': inReasoning = true; break;
+          case 'reasoning-end': inReasoning = false; break;
+          case 'tool-input-start':
+            cur = { id: ev.id || '', name: ev.toolName || '', args: '' };
+            break;
+          case 'tool-input-delta':
+            if (cur) cur.args += ev.delta || '';
+            break;
+          case 'tool-input-end':
+            if (cur) { addTool(cur.id, cur.name, cur.args); cur = null; }
+            break;
+          case 'tool-call': {
+            const id = ev.toolCallId || ev.id || '';
+            if (cur && id && cur.id === id) { addTool(id, cur.name || ev.toolName || '', cur.args); cur = null; break; }
+            addTool(id, ev.toolName || '', typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input || {}));
+            break;
+          }
+          case 'finish-step': {
+            inReasoning = false;
+            const u = ev.usage || {};
+            inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0;
+            break;
+          }
+          case 'finish':
+            finishReason = ev.finishReason === 'length' ? 'length'
+              : (ev.finishReason === 'tool-calls' || ev.finishReason === 'tool_calls') ? 'tool_calls' : 'stop';
+            break;
+        }
+      }
+    }
+    if (cur) addTool(cur.id, cur.name, cur.args);
+  } catch (e) {
+    if (e.message === 'Stream read timeout') {
+      const timeoutS = Math.round((inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000)) / 1000);
+      log('warn', `Stream timeout during non-stream collect (${timeoutS}s no data${inReasoning ? ', reasoning phase' : ''})`);
+      timedOut = true;
+      reader.cancel().catch(() => {});
+    } else throw e;
+  }
+  if (timedOut) text += `[ERROR: Upstream timeout — no response for ${Math.round((inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000)) / 1000)}s]`;
+  return { text, reasoning, toolCalls, inputTokens, outputTokens, finishReason };
+}
+
+function safeParseJson(s) {
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
 function jsonRes(res, status, body, headers = {}) {
   const h = { 'Content-Type': 'application/json', ...headers };
   res.writeHead(status, h);
@@ -853,6 +965,20 @@ function sseData(res, data) {
 function createOpenAiTranslator(completionId, model) {
   let inputTokens = 0, outputTokens = 0, cachedTokens = 0, roleSent = false;
   let toolCallIndex = 0, currentToolId = '', currentToolName = '', currentToolArgs = '';
+  const emittedToolIds = new Set();
+
+  const base = () => ({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model });
+
+  // Emit a tool call chunk. Handles both the incremental (tool-input-*) flow and
+  // the complete (tool-call) event; dedups by toolCallId so a model that emits
+  // both never produces duplicate calls.
+  function emitToolCall(chunks, id, name, args) {
+    if (id && emittedToolIds.has(id)) return;
+    if (id) emittedToolIds.add(id);
+    const idx = toolCallIndex++;
+    chunks.push({ ...base(), choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id, type: 'function', function: { name: name || '', arguments: args || '' } }] }, finish_reason: null }] });
+  }
+
   return function translate(ndjsonLines) {
     const chunks = [];
     for (const line of ndjsonLines) {
@@ -861,11 +987,16 @@ function createOpenAiTranslator(completionId, model) {
       try { ev = JSON.parse(line); } catch { continue; }
       const type = ev.type || '';
       if (type === 'start') {
-        if (!roleSent) { chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }); roleSent = true; }
+        if (!roleSent) { chunks.push({ ...base(), choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }); roleSent = true; }
       } else if (type === 'start-step' || type === 'reasoning-start' || type === 'text-start') {}
-      else if (type === 'text-delta' || type === 'reasoning-delta') {
+      else if (type === 'text-delta') {
         const text = ev.text || '';
-        if (text) chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+        if (text) chunks.push({ ...base(), choices: [{ index: 0, delta: { content: text }, finish_reason: null }] });
+      } else if (type === 'reasoning-delta') {
+        // Reasoning goes to delta.reasoning_content (DeepSeek-style), never into
+        // content — clients show it as thinking instead of polluting the answer.
+        const text = ev.text || '';
+        if (text) chunks.push({ ...base(), choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }] });
       } else if (type === 'text-end' || type === 'reasoning-end') {}
       // Tool call events from CC API
       else if (type === 'tool-input-start') {
@@ -875,14 +1006,12 @@ function createOpenAiTranslator(completionId, model) {
       } else if (type === 'tool-input-delta') {
         currentToolArgs += (ev.delta || '');
       } else if (type === 'tool-input-end') {
-        // Emit the tool call as a delta chunk
-        const idx = toolCallIndex++;
-        chunks.push({
-          id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model,
-          choices: [{ index: 0, delta: { tool_calls: [{ index: idx, id: currentToolId, type: 'function', function: { name: currentToolName, arguments: currentToolArgs } }] }, finish_reason: null }],
-        });
+        emitToolCall(chunks, currentToolId, currentToolName, currentToolArgs);
+        currentToolId = ''; currentToolName = ''; currentToolArgs = '';
       } else if (type === 'tool-call') {
-        // Final tool call confirmation (already emitted via tool-input-end)
+        // Fallback: some models emit a complete tool-call without incremental events
+        emitToolCall(chunks, ev.toolCallId || ev.id || '', ev.toolName || '',
+          typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input || {}));
       } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0;
@@ -890,10 +1019,10 @@ function createOpenAiTranslator(completionId, model) {
         cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
-        chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
+        chunks.push({ ...base(), choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
       } else if (type === 'finish') {
         const fr = ev.finishReason === 'length' ? 'length' : ev.finishReason === 'tool-calls' ? 'tool_calls' : 'stop';
-        chunks.push({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
+        chunks.push({ ...base(), choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
         recordTokens(model, inputTokens, outputTokens);
       }
     }
@@ -906,10 +1035,35 @@ function createOpenAiTranslator(completionId, model) {
 function createAnthropicTranslator(messageId, model) {
   let inputTokens = 0, outputTokens = 0;
   let started = false;
-  let blockIndex = 0;
-  let blockOpen = false;
-  let currentText = '';
+  let blockIndex = -1;
+  let blockType = null;          // 'text' | 'thinking' | 'tool' — currently open block
+  let currentThinkingText = '';
   let currentToolId = '', currentToolName = '', currentToolArgs = '';
+  const emittedToolIds = new Set();
+  let stopReason = 'end_turn';
+
+  // Close the open block (if any). Thinking blocks get a signature_delta before
+  // stop so Claude Code accepts and displays them.
+  function closeBlock() {
+    const events = [];
+    if (!blockType) return events;
+    if (blockType === 'thinking') {
+      events.push({ event: 'content_block_delta', data: { type: 'content_block_delta', index: blockIndex, delta: { type: 'signature_delta', signature: fakeThinkingSignature(currentThinkingText) } } });
+      currentThinkingText = '';
+    }
+    events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex } });
+    blockType = null;
+    return events;
+  }
+
+  // Open a new block, closing any previous one first (lazy close keeps indices stable)
+  function openBlock(type, contentBlock) {
+    const events = closeBlock();
+    blockIndex++;
+    blockType = type;
+    events.push({ event: 'content_block_start', data: { type: 'content_block_start', index: blockIndex, content_block: contentBlock } });
+    return events;
+  }
 
   function translate(ndjsonLines) {
     const events = [];
@@ -924,84 +1078,131 @@ function createAnthropicTranslator(messageId, model) {
         events.push({ event: 'message_start', data: {
           type: 'message_start', message: { id: messageId, type: 'message', role: 'assistant', content: [], model, stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } }
         }});
-      } else if (type === 'text-start') {
-        // Close previous block if still open (no explicit end event)
-        if (blockOpen) {
-          events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
-          blockIndex++;
-        }
-        blockOpen = true;
-        currentText = '';
-        events.push({ event: 'content_block_start', data: {
-          type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' }
-        }});
-      } else if (type === 'text-delta' || type === 'reasoning-delta') {
+      } else if (type === 'reasoning-delta') {
+        // CC reasoning → Anthropic thinking block (Claude Code shows this as thinking,
+        // never mixed into the answer text)
         const text = ev.text || '';
-        if (text) events.push({ event: 'content_block_delta', data: {
+        if (!text) continue;
+        if (blockType !== 'thinking') events.push(...openBlock('thinking', { type: 'thinking', thinking: '' }));
+        currentThinkingText += text;
+        events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: text }
+        }});
+      } else if (type === 'text-delta') {
+        const text = ev.text || '';
+        if (!text) continue;
+        if (blockType !== 'text') events.push(...openBlock('text', { type: 'text', text: '' }));
+        events.push({ event: 'content_block_delta', data: {
           type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text }
         }});
-      } else if (type === 'text-end' || type === 'reasoning-end') {
-        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
-        blockOpen = false;
-        blockIndex++;
       } else if (type === 'tool-input-start') {
-        // Close previous block if still open
-        if (blockOpen) {
-          events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
-          blockIndex++;
-        }
-        blockOpen = true;
         currentToolId = ev.id || '';
         currentToolName = ev.toolName || '';
         currentToolArgs = '';
-        events.push({ event: 'content_block_start', data: {
-          type: 'content_block_start', index: blockIndex, content_block: { type: 'tool_use', id: currentToolId, name: currentToolName, input: {} }
-        }});
+        if (currentToolId) emittedToolIds.add(currentToolId);
+        events.push(...openBlock('tool', { type: 'tool_use', id: currentToolId, name: currentToolName, input: {} }));
       } else if (type === 'tool-input-delta') {
-        currentToolArgs += (ev.delta || '');
-      } else if (type === 'tool-input-end') {
-        events.push({ event: 'content_block_delta', data: {
-          type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: currentToolArgs }
+        const delta = ev.delta || '';
+        currentToolArgs += delta;
+        if (delta && blockType === 'tool') events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: delta }
         }});
-        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
-        blockOpen = false;
-        blockIndex++;
-        // Already handled via tool-input-end
+      } else if (type === 'tool-input-end') {
+        // Args already streamed via input_json_delta; close the tool block
+        events.push(...closeBlock());
+      } else if (type === 'tool-call') {
+        // Fallback: some models emit a complete tool-call without incremental events
+        const id = ev.toolCallId || ev.id || '';
+        if (id && emittedToolIds.has(id)) continue;
+        if (id) emittedToolIds.add(id);
+        const input = typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input || {});
+        events.push(...openBlock('tool', { type: 'tool_use', id, name: ev.toolName || '', input: {} }));
+        if (input) events.push({ event: 'content_block_delta', data: {
+          type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: input }
+        }});
+        events.push(...closeBlock());
       } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0;
         outputTokens = u.outputTokens || 0;
+      } else if (type === 'finish') {
+        stopReason = ev.finishReason === 'tool-calls' || ev.finishReason === 'tool_calls' ? 'tool_use'
+                   : ev.finishReason === 'length' ? 'max_tokens' : 'end_turn';
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
-        events.push({ event: 'content_block_start', data: {
-          type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' }
-        }});
-        events.push({ event: 'content_block_delta', data: {
-          type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: '[ERROR: ' + msg + ']' }
-        }});
-        events.push({ event: 'content_block_stop', data: { type: 'content_block_stop', index: blockIndex }});
-        blockIndex++;
+        events.push(...closeBlock());
+        events.push({ event: 'error', data: { type: 'error', error: { type: 'internal_error', message: msg } } });
       }
+      // start-step / text-start / reasoning-start / text-end / reasoning-end / tool-error: no user-visible data
     }
     return events;
   }
 
   function finalize() {
-    const stopReason = 'end_turn';
     recordTokens(model, inputTokens, outputTokens);
-    return [
-      { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } } },
-      { event: 'message_stop', data: { type: 'message_stop' } },
-    ];
+    const events = closeBlock();
+    events.push({ event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { input_tokens: inputTokens, output_tokens: outputTokens } } });
+    events.push({ event: 'message_stop', data: { type: 'message_stop' } });
+    return events;
   }
 
   return { translate, finalize };
 }
 
 // ── NDJSON → Responses SSE Translation ──────────────────────────────────────
+// Emits the standard OpenAI Responses streaming sequence:
+//   response.created → response.output_item.added → (response.output_text.delta |
+//   response.reasoning_summary_text.delta | response.function_call_arguments.delta)
+//   → response.output_item.done → response.completed
 
 function createResponsesTranslator(responseId, model) {
-  let textContent = '', started = false, inputTokens = 0, outputTokens = 0;
+  let started = false;
+  let inputTokens = 0, outputTokens = 0, cachedTokens = 0;
+  const outputItems = [];        // completed items, assembled into response.completed
+  let outputIndex = -1;
+  let openKind = null;           // 'reasoning' | 'text' | 'tool'
+  let openItemId = null;
+  let textContent = '', reasoningText = '';
+  let currentToolId = '', currentToolName = '', currentToolArgs = '';
+  const emittedToolIds = new Set();
+
+  function responseObj(status) {
+    return { id: responseId, object: 'response', created_at: nowUnix(), model, status, output: status === 'completed' ? outputItems : [] };
+  }
+
+  function closeOpenItem(events) {
+    if (!openKind) return;
+    if (openKind === 'reasoning') {
+      events.push({ event: 'response.reasoning_summary_text.done', data: { type: 'response.reasoning_summary_text.done', item_id: openItemId, output_index: outputIndex, summary_index: 0, text: reasoningText } });
+      events.push({ event: 'response.reasoning_summary_part.done', data: { type: 'response.reasoning_summary_part.done', item_id: openItemId, output_index: outputIndex, summary_index: 0, part: { type: 'summary', text: reasoningText } } });
+      const item = { id: openItemId, type: 'reasoning', summary: [{ type: 'summary', text: reasoningText }] };
+      events.push({ event: 'response.output_item.done', data: { type: 'response.output_item.done', output_index: outputIndex, item: { ...item, status: 'completed' } } });
+      outputItems.push(item);
+      reasoningText = '';
+    } else if (openKind === 'text') {
+      events.push({ event: 'response.output_text.done', data: { type: 'response.output_text.done', item_id: openItemId, output_index: outputIndex, content_index: 0, text: textContent } });
+      events.push({ event: 'response.content_part.done', data: { type: 'response.content_part.done', item_id: openItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: textContent, annotations: [] } } });
+      const item = { id: openItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: textContent, annotations: [] }] };
+      events.push({ event: 'response.output_item.done', data: { type: 'response.output_item.done', output_index: outputIndex, item } });
+      outputItems.push(item);
+      textContent = '';
+    } else if (openKind === 'tool') {
+      events.push({ event: 'response.function_call_arguments.done', data: { type: 'response.function_call_arguments.done', item_id: openItemId, output_index: outputIndex, arguments: currentToolArgs } });
+      const item = { id: openItemId, type: 'function_call', status: 'completed', call_id: currentToolId, name: currentToolName, arguments: currentToolArgs };
+      events.push({ event: 'response.output_item.done', data: { type: 'response.output_item.done', output_index: outputIndex, item } });
+      outputItems.push(item);
+      currentToolArgs = '';
+    }
+    openKind = null; openItemId = null;
+  }
+
+  function openItem(events, kind, item) {
+    closeOpenItem(events);
+    outputIndex++;
+    openKind = kind; openItemId = item.id;
+    events.push({ event: 'response.output_item.added', data: { type: 'response.output_item.added', output_index: outputIndex, item: { ...item, status: 'in_progress' } } });
+  }
+
   function translate(ndjsonLines) {
     const events = [];
     for (const line of ndjsonLines) {
@@ -1011,27 +1212,79 @@ function createResponsesTranslator(responseId, model) {
       const type = ev.type || '';
       if (type === 'start' && !started) {
         started = true;
-        events.push({ event: 'response.created', data: { type: 'response.created', response: { id: responseId, model, status: 'in_progress', output: [] } } });
-        events.push({ event: 'response.in_progress', data: { type: 'response.in_progress', response: { id: responseId } } });
-      } else if (type === 'text-delta' || type === 'reasoning-delta') {
+        events.push({ event: 'response.created', data: { type: 'response.created', response: responseObj('in_progress') } });
+        events.push({ event: 'response.in_progress', data: { type: 'response.in_progress', response: responseObj('in_progress') } });
+      } else if (type === 'reasoning-delta') {
         const text = ev.text || '';
-        if (text) { textContent += text; events.push({ event: 'response.output_item.delta', data: { type: 'response.output_item.delta', delta: { type: 'content.delta', content_index: 0, text } } }); }
-      } else if (type === 'error') {
-        const msg = ev.error?.message || 'CC API error';
-        textContent += '[ERROR: ' + msg + ']';
+        if (!text) continue;
+        if (openKind !== 'reasoning') {
+          openItem(events, 'reasoning', { id: `rs_${randomUUID().slice(0, 12)}`, type: 'reasoning', summary: [] });
+          events.push({ event: 'response.reasoning_summary_part.added', data: { type: 'response.reasoning_summary_part.added', item_id: openItemId, output_index: outputIndex, summary_index: 0, part: { type: 'summary', text: '' } } });
+        }
+        reasoningText += text;
+        events.push({ event: 'response.reasoning_summary_text.delta', data: { type: 'response.reasoning_summary_text.delta', item_id: openItemId, output_index: outputIndex, summary_index: 0, delta: text } });
+      } else if (type === 'text-delta') {
+        const text = ev.text || '';
+        if (!text) continue;
+        if (openKind !== 'text') {
+          openItem(events, 'text', { id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', role: 'assistant', content: [] });
+          events.push({ event: 'response.content_part.added', data: { type: 'response.content_part.added', item_id: openItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } } });
+        }
+        textContent += text;
+        events.push({ event: 'response.output_text.delta', data: { type: 'response.output_text.delta', item_id: openItemId, output_index: outputIndex, content_index: 0, delta: text } });
+      } else if (type === 'tool-input-start') {
+        currentToolId = ev.id || '';
+        currentToolName = ev.toolName || '';
+        currentToolArgs = '';
+        if (currentToolId) emittedToolIds.add(currentToolId);
+        openItem(events, 'tool', { id: `fc_${randomUUID().slice(0, 12)}`, type: 'function_call', call_id: currentToolId, name: currentToolName, arguments: '' });
+      } else if (type === 'tool-input-delta') {
+        const delta = ev.delta || '';
+        currentToolArgs += delta;
+        if (delta && openKind === 'tool') events.push({ event: 'response.function_call_arguments.delta', data: { type: 'response.function_call_arguments.delta', item_id: openItemId, output_index: outputIndex, delta } });
+      } else if (type === 'tool-input-end') {
+        closeOpenItem(events);
+      } else if (type === 'tool-call') {
+        // Fallback: some models emit a complete tool-call without incremental events
+        const id = ev.toolCallId || ev.id || '';
+        if (id && emittedToolIds.has(id)) continue;
+        if (id) emittedToolIds.add(id);
+        const args = typeof ev.input === 'string' ? ev.input : JSON.stringify(ev.input || {});
+        openItem(events, 'tool', { id: `fc_${randomUUID().slice(0, 12)}`, type: 'function_call', call_id: id, name: ev.toolName || '', arguments: '' });
+        currentToolArgs = args;
+        if (args) events.push({ event: 'response.function_call_arguments.delta', data: { type: 'response.function_call_arguments.delta', item_id: openItemId, output_index: outputIndex, delta: args } });
+        closeOpenItem(events);
       } else if (type === 'finish-step') {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0;
+        cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
+      } else if (type === 'error') {
+        const msg = ev.error?.message || 'CC API error';
+        // Surface as output text so the client sees the failure, stream still completes
+        if (openKind !== 'text') {
+          openItem(events, 'text', { id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', role: 'assistant', content: [] });
+          events.push({ event: 'response.content_part.added', data: { type: 'response.content_part.added', item_id: openItemId, output_index: outputIndex, content_index: 0, part: { type: 'output_text', text: '', annotations: [] } } });
+        }
+        textContent += '[ERROR: ' + msg + ']';
+        events.push({ event: 'response.output_text.delta', data: { type: 'response.output_text.delta', item_id: openItemId, output_index: outputIndex, content_index: 0, delta: '[ERROR: ' + msg + ']' } });
       }
+      // start-step / text-start / reasoning-start / text-end / reasoning-end / tool-error: no user-visible data
     }
     return events;
   }
+
   function finalize() {
+    const events = [];
+    closeOpenItem(events);
     recordTokens(model, inputTokens, outputTokens);
-    return [
-      { event: 'response.output_item.done', data: { type: 'response.output_item.done', item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] } } },
-      { event: 'response.completed', data: { type: 'response.completed', response: { id: responseId, model, status: 'completed', usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens }, output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: textContent }] }] } } }
-    ];
+    events.push({ event: 'response.completed', data: {
+      type: 'response.completed',
+      response: { ...responseObj('completed'), usage: {
+        input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens,
+        input_tokens_details: { cached_tokens: cachedTokens }, output_tokens_details: { reasoning_tokens: 0 },
+      } },
+    } });
+    return events;
   }
   return { translate, finalize };
 }
@@ -1053,8 +1306,8 @@ async function handleChatCompletions(req, res) {
   log('debug', `Request body`, { client, model, stream: openaiReq.stream, tools: openaiReq.tools?.length || 0, temperature: openaiReq.temperature, max_tokens: openaiReq.max_tokens });
 
   try {
-    // 503 retry: keep trying for 60 seconds, no fixed delay
-    const RETRY_DEADLINE = Date.now() + 60000; // 60 seconds
+    // 503 retry: keep trying for 120 seconds, retry on ANY upstream error
+    const RETRY_DEADLINE = Date.now() + 120000; // 120 seconds
     let lastError = null;
     let attempt = 0;
 
@@ -1068,14 +1321,46 @@ async function handleChatCompletions(req, res) {
       const ccRes = await forwardToCC(ccBody, apiKey);
       if (!ccRes.ok) {
         const errText = await ccRes.text().catch(() => '');
-        log('error', `CC error: ${ccRes.status} ${model} ${errText.slice(0, 300)}`);
-        return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message: errText.slice(0, 500) || `CC API error: ${ccRes.status}`, type: 'proxy_error' } });
+        const { message, code } = parseUpstreamError(errText, ccRes.status);
+        log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
+        // Auth errors (401/403) are permanent — return immediately
+        if (ccRes.status === 401 || ccRes.status === 403) {
+          return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
+        }
+        // Transient upstream error (429 / 5xx) → retry within the deadline
+        lastError = `[ERROR: ${message}]`;
+        if (Date.now() >= RETRY_DEADLINE) {
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, type: 'proxy_error', ...(code ? { code } : {}) } });
+        }
+        continue;
+      }
+
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+
+      // Non-streaming: collect the whole stream, then respond with JSON
+      if (openaiReq.stream === false) {
+        const r = await collectCcStream(reader);
+        if (r.text.startsWith('[ERROR:') && !r.toolCalls.length) {
+          lastError = r.text;
+          log('warn', `Transient error on ${model} (non-stream), retrying: ${r.text.slice(0, 100)}`);
+          if (Date.now() >= RETRY_DEADLINE) {
+            return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${r.text.replace(/^\[ERROR: /, '').replace(/]$/, '').slice(0, 300)}`, type: 'proxy_error' } });
+          }
+          continue;
+        }
+        const message = { role: 'assistant', content: r.text };
+        if (r.reasoning) message.reasoning_content = r.reasoning;
+        if (r.toolCalls.length) message.tool_calls = r.toolCalls.map(tc => ({ id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments } }));
+        return jsonRes(res, 200, {
+          id: completionId, object: 'chat.completion', created: nowUnix(), model,
+          choices: [{ index: 0, message, finish_reason: r.toolCalls.length ? 'tool_calls' : r.finishReason }],
+          usage: { prompt_tokens: r.inputTokens, completion_tokens: r.outputTokens, total_tokens: r.inputTokens + r.outputTokens },
+        });
       }
 
       // Phase 1: Buffer initial events (before headers) to detect transient errors
       const translate = createOpenAiTranslator(completionId, model);
-      const reader = ccRes.body.getReader();
-      const decoder = new TextDecoder();
       let buffer = '';
       let preHeadersChunks = [];
       let earlyError = null;
@@ -1092,7 +1377,7 @@ async function handleChatCompletions(req, res) {
         for (const chunk of chunks) {
           const delta = chunk.choices?.[0]?.delta?.content || '';
           const fr = chunk.choices?.[0]?.finish_reason;
-          if (delta.startsWith('[ERROR:') && delta.includes('Service temporarily unavailable')) {
+          if (delta.startsWith('[ERROR:')) {
             earlyError = delta;
           }
           preHeadersChunks.push(chunk);
@@ -1107,10 +1392,10 @@ async function handleChatCompletions(req, res) {
         log('warn', `Transient error on ${model}, retrying: ${earlyError.slice(0, 100)}`);
         lastError = earlyError;
         reader.cancel().catch(() => {});
-        // Check if we've exceeded the 60s deadline
+        // Check if we've exceeded the 120s deadline
         if (Date.now() >= RETRY_DEADLINE) {
           log('error', `Retry deadline reached for ${model} after ${attempt} attempts`);
-          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (60s): ${earlyError.replace('[ERROR: ', '').replace(']', '')}`, type: 'proxy_error' } });
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${earlyError.replace('[ERROR: ', '').replace(']', '')}`, type: 'proxy_error' } });
         }
         continue;
       }
@@ -1118,53 +1403,31 @@ async function handleChatCompletions(req, res) {
       // Non-retryable error or success → break out of retry loop
 
       // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
-      if (openaiReq.stream === false) {
-        // Non-streaming: collect all chunks and return JSON
-        let fullText = '';
-        let inputTokens = 0, outputTokens = 0, finishReason = 'stop';
-        for (const chunk of preHeadersChunks) {
-          const delta = chunk.choices?.[0]?.delta;
-          if (delta?.content) fullText += delta.content;
-          if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
-          if (chunk.usage) { inputTokens = chunk.usage.prompt_tokens || 0; outputTokens = chunk.usage.completion_tokens || 0; }
-        }
-        while (true) {
-          const { done, value } = await readWithTimeout(reader);
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop();
-          const chunks = translate(lines);
-          for (const chunk of chunks) {
-            const delta = chunk.choices?.[0]?.delta;
-            if (delta?.content) fullText += delta.content;
-            if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
-            if (chunk.usage) { inputTokens = chunk.usage.prompt_tokens || 0; outputTokens = chunk.usage.completion_tokens || 0; }
-          }
-        }
-        return jsonRes(res, 200, {
-          id: completionId, object: 'chat.completion', created: nowUnix(), model,
-          choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: finishReason }],
-          usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
-        });
-      }
       sseHeaders(res);
       for (const chunk of preHeadersChunks) sseData(res, chunk);
 
       let streamTimedOut = false;
+      let inReasoning = false;
       try {
         while (true) {
-          const { done, value } = await readWithTimeout(reader, 60000);
+          const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+          const { done, value } = await readWithTimeout(reader, timeoutMs);
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
           const lines = buffer.split('\n');
           buffer = lines.pop();
+          for (const ln of lines) {
+            if (ln.includes('"reasoning-start"')) inReasoning = true;
+            else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+          }
           const chunks = translate(lines);
           for (const chunk of chunks) sseData(res, chunk);
         }
       } catch (e) {
         if (e.message === 'Stream read timeout') {
-          log('warn', `Stream timeout on ${model} (60s no data)`);
+          const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+          const timeoutS = Math.round(timeoutMs / 1000);
+          log('warn', `Stream timeout on ${model} (${timeoutS}s no data${inReasoning ? ', reasoning phase' : ''})`);
           streamTimedOut = true;
           reader.cancel().catch(() => {});
         } else throw e;
@@ -1175,7 +1438,8 @@ async function handleChatCompletions(req, res) {
       }
 
       if (streamTimedOut) {
-        res.write(`data: ${JSON.stringify({id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{index: 0, delta: {content: '[ERROR: Upstream timeout — no response for 60s]'}, finish_reason: 'stop'}]})}\n\n`);
+        const timeoutS = Math.round((inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000)) / 1000);
+        res.write(`data: ${JSON.stringify({id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{index: 0, delta: {content: `[ERROR: Upstream timeout — no response for ${timeoutS}s${inReasoning ? ' (reasoning phase)' : ''}]`}, finish_reason: 'stop'}]})}\n\n`);
         res.write('data: [DONE]\n\n');
       } else {
         res.write('data: [DONE]\n\n');
@@ -1211,34 +1475,23 @@ async function handleMessages(req, res) {
     const ccRes = await forwardToCC(ccBody, apiKey);
     if (!ccRes.ok) {
       const errText = await ccRes.text().catch(() => '');
-      log('error', `CC error: ${ccRes.status}`);
-      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) || `CC API error: ${ccRes.status}` } });
+      const { message, code } = parseUpstreamError(errText, ccRes.status);
+      log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
+      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { type: 'error', error: { type: 'api_error', message, ...(code ? { code } : {}) } });
     }
 
     // Non-streaming: collect all and return JSON
     if (anthropicReq.stream === false) {
       const reader = ccRes.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
-      while (true) {
-        const { done, value } = await readWithTimeout(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            if (ev.type === 'text-delta' || ev.type === 'reasoning-delta') fullText += ev.text || '';
-            if (ev.type === 'finish-step') { inputTokens = ev.usage?.inputTokens || 0; outputTokens = ev.usage?.outputTokens || 0; }
-          } catch {}
-        }
-      }
+      const r = await collectCcStream(reader);
+      const content = [];
+      if (r.reasoning) content.push({ type: 'thinking', thinking: r.reasoning, signature: fakeThinkingSignature(r.reasoning) });
+      if (r.text || !r.toolCalls.length) content.push({ type: 'text', text: r.text });
+      for (const tc of r.toolCalls) content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: safeParseJson(tc.arguments) });
       return jsonRes(res, 200, {
-        id: messageId, type: 'message', role: 'assistant', content: [{ type: 'text', text: fullText }],
-        model, stop_reason: 'end_turn', stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+        id: messageId, type: 'message', role: 'assistant', content,
+        model, stop_reason: r.toolCalls.length ? 'tool_use' : (r.finishReason === 'length' ? 'max_tokens' : 'end_turn'), stop_sequence: null,
+        usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
       });
     }
 
@@ -1247,13 +1500,19 @@ async function handleMessages(req, res) {
     const reader = ccRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let inReasoning = false;
 
     while (true) {
-      const { done, value } = await readWithTimeout(reader, 60000);
+      const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+      const { done, value } = await readWithTimeout(reader, timeoutMs);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
+      for (const ln of lines) {
+        if (ln.includes('"reasoning-start"')) inReasoning = true;
+        else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      }
       const events = translate(lines);
       for (const ev of events) sseWrite(res, ev.event, ev.data);
     }
@@ -1297,34 +1556,23 @@ async function handleResponses(req, res) {
     const ccRes = await forwardToCC(ccBody, apiKey);
     if (!ccRes.ok) {
       const errText = await ccRes.text().catch(() => '');
-      log('error', `CC error: ${ccRes.status}`);
-      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message: errText.slice(0, 500) || `CC API error: ${ccRes.status}`, type: 'proxy_error' } });
+      const { message, code } = parseUpstreamError(errText, ccRes.status);
+      log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
+      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
     }
 
     // Non-streaming: collect all and return JSON
     if (responsesReq.stream === false) {
       const reader = ccRes.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '', fullText = '', inputTokens = 0, outputTokens = 0;
-      while (true) {
-        const { done, value } = await readWithTimeout(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const ev = JSON.parse(line);
-            if (ev.type === 'text-delta' || ev.type === 'reasoning-delta') fullText += ev.text || '';
-            if (ev.type === 'finish-step') { inputTokens = ev.usage?.inputTokens || 0; outputTokens = ev.usage?.outputTokens || 0; }
-          } catch {}
-        }
-      }
+      const r = await collectCcStream(reader);
+      const output = [];
+      if (r.reasoning) output.push({ id: `rs_${randomUUID().slice(0, 12)}`, type: 'reasoning', summary: [{ type: 'summary', text: r.reasoning }] });
+      if (r.text || !r.toolCalls.length) output.push({ id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: r.text, annotations: [] }] });
+      for (const tc of r.toolCalls) output.push({ id: `fc_${randomUUID().slice(0, 12)}`, type: 'function_call', status: 'completed', call_id: tc.id, name: tc.name, arguments: tc.arguments });
       return jsonRes(res, 200, {
-        id: responseId, object: 'response', status: 'completed', model,
-        output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullText }] }],
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: inputTokens + outputTokens },
+        id: responseId, object: 'response', created_at: nowUnix(), status: 'completed', model,
+        output,
+        usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens, total_tokens: r.inputTokens + r.outputTokens, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
       });
     }
 
@@ -1333,13 +1581,19 @@ async function handleResponses(req, res) {
     const reader = ccRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+    let inReasoning = false;
 
     while (true) {
-      const { done, value } = await readWithTimeout(reader, 60000);
+      const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+      const { done, value } = await readWithTimeout(reader, timeoutMs);
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
+      for (const ln of lines) {
+        if (ln.includes('"reasoning-start"')) inReasoning = true;
+        else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      }
       const events = translate(lines);
       for (const ev of events) sseWrite(res, ev.event, ev.data);
     }
@@ -1354,8 +1608,9 @@ async function handleResponses(req, res) {
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else {
       try {
-        sseWrite(res, 'response.output_item.delta', { type: 'response.output_item.delta', delta: { type: 'content.delta', content_index: 0, text: `[ERROR: Upstream timeout — ${e.message}]` } });
-        sseWrite(res, 'response.completed', { type: 'response.completed', response: { id: responseId, status: 'completed' } });
+        sseWrite(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: 'msg_error', output_index: 0, content_index: 0, delta: `[ERROR: Upstream timeout — ${e.message}]` });
+        sseWrite(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: { id: 'msg_error', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: `[ERROR: Upstream timeout — ${e.message}]`, annotations: [] }] } });
+        sseWrite(res, 'response.completed', { type: 'response.completed', response: { id: responseId, object: 'response', status: 'completed', output: [] } });
       } catch {}
       res.end();
     }
@@ -1407,11 +1662,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.0', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.25', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.0', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.25', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -1582,7 +1837,7 @@ async function start() {
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
-    console.log(`\n  cc-gateway v1.0.0`);
+    console.log(`\n  cc-gateway v1.0.25`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
