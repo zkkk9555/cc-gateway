@@ -346,10 +346,26 @@ CC 上游可能以两种事件序列发出工具调用，翻译器两者都支�
 ## 日志格式
 
 ```
-[2026-08-27T00:00:00.000Z] [info] CC Gateway started {"port":3050,"api":"https://api.commandcode.ai"}
+[2026-08-27T00:00:00.000Z] [info] cc-gateway started {"port":3050,"api":"https://api.commandcode.ai"}
 [2026-08-27T00:00:01.000Z] [info] Fingerprint recorded
-[2026-08-27T00:00:02.000Z] [info] Request {"model":"deepseek/deepseek-v4-flash","path":"/v1/chat/completions"}
+[2026-08-27T00:00:02.000Z] [info] [ra3f9c2] Request: deepseek/deepseek-v4-flash /v1/chat/completions [hermes]
+[2026-08-27T00:00:05.000Z] [warn] [ra3f9c2] Upstream stream error event: Service temporarily unavailable
+[2026-08-27T00:00:05.000Z] [warn] [ra3f9c2] Transient error on deepseek/deepseek-v4-flash, retrying: [ERROR: ...]
+[2026-08-27T00:00:08.000Z] [info] [ra3f9c2] Request done: POST /v1/chat/completions 200 in 6123ms
 ```
+
+**请求关联 ID（v1.028）**：每个请求自动分配 `r+6位hex` 的短 ID，借 AsyncLocalStorage 自动出现在该请求生命周期内的**所有**日志行上（含翻译器内部），并发时可将一次请求的完整链路（接收→重试→错误→完成）从日志中单独串出来。
+
+**排障关键日志**：
+- `Request done: <方法> <路径> <状态码> in <耗时>ms` — 每个网关请求的结束记录
+- `Client disconnected early` — 客户端提前断开（Agent 中止常见）
+- `Upstream stream error event:` — 流中途上游报错（含流式提交后的情况）
+- `Unknown CC event type:` — 上游出现未知事件（**协议漂移预警**，每请求每类型只记一次；若上游升级协议导致内容异常，先查这个）
+- `Upstream tool error event:` — 上游工具调用失败
+- `Permanent upstream error` / `Transient error ... retrying` / `Connection error ... retrying` — 错误分类与重试过程
+- `CC error: <状态码> <模型> <错误码> <消息>` — 上游 HTTP 错误（含原始错误消息前 300 字符）
+
+文件：`logs/gateway-YYYY-MM-DD.log` 按天滚动，同步输出 stderr 与 dashboard 实时日志（内存缓冲 200 条）。日志同时驱动修复：出现 `Unknown CC event type` 或 `parseUpstreamError` 未识别的错误体时，日志中保留了原始数据前 150/300 字符，可直接用于适配。
 
 支持 `LOG_LEVEL` 环境变量：debug / info / warn / error
 

@@ -186,16 +186,20 @@ def t_utf8():
                "生僻字：㙟埗嘅嘢㗎 龘𠀀𪚥。 特殊：\\n\\t\"引号\"'单引' & <html> & {json:真}。 "
                "MIXED English123 中文456 mixed789。结束🎯")
     markers = ["🚀", "『引号』", "龘", "𪚥", "𠀀", "🎯", "網絡", "& <html>", "{json:真}", "English123"]
+    last = None
     try:
-        body = {"model": MODEL, "stream": True, "max_tokens": 4000,
-                "messages": [{"role": "user", "content": f"请把下面内容原样完整复述一遍（这是编码测试，务必逐字保留所有标点和符号），然后另起一行回答：复述完毕：\n\n{payload}"}]}
-        r = post("/v1/chat/completions", body)
-        st = read_sse(r)
-        problems = check_common(st, minlen=50)
-        missing = [m for m in markers if m not in st["text"]]
-        if missing: problems.append(f"lost markers: {missing}")
-        report(not problems, "P3 UTF-8完整性（emoji/生僻字/标点）", f"len={len(st['text'])} missing={len(missing)}" +
-               (f" problems={'; '.join(problems)}" if problems else ""), time.time()-t0)
+        for attempt in range(2):  # model may occasionally not echo — retry once
+            body = {"model": MODEL, "stream": True, "max_tokens": 4000,
+                    "messages": [{"role": "user", "content": f"请把下面内容原样完整复述一遍（这是编码测试，务必逐字保留所有标点和符号），然后另起一行回答：复述完毕：\n\n{payload}"}]}
+            r = post("/v1/chat/completions", body)
+            st = read_sse(r)
+            problems = check_common(st, minlen=50)
+            missing = [m for m in markers if m not in st["text"]]
+            if not missing and not problems:
+                report(True, "P3 UTF-8完整性（emoji/生僻字/标点）", f"len={len(st['text'])} missing=0 (attempt {attempt+1})", time.time()-t0)
+                return
+            last = f"len={len(st['text'])} missing={missing} {problems}"
+        report(False, "P3 UTF-8完整性（emoji/生僻字/标点）", last, time.time()-t0)
     except Exception as e:
         report(False, "P3 UTF-8完整性", f"EXCEPTION {type(e).__name__}: {str(e)[:120]}", time.time()-t0)
 

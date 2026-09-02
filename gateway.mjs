@@ -15,6 +15,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.27
+  console.log(`cc-gateway v1.0.28
 Usage:
   node gateway.mjs              Start the gateway
   node gateway.mjs --set-key    Set API key interactively
@@ -33,7 +34,7 @@ Usage:
   node gateway.mjs --help       Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.27'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.28'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -98,11 +99,21 @@ function getLogFile() {
   return logStream;
 }
 
+// Request correlation: every log line emitted while handling a request is
+// prefixed with its short id, so concurrent requests' lines can be separated
+// and a single request's full lifecycle reconstructed from the log file.
+const requestStore = new AsyncLocalStorage();
+function newReqId() { return 'r' + crypto.randomBytes(3).toString('hex'); }
+function reqTag() {
+  const s = requestStore.getStore();
+  return s?.reqId ? ` [${s.reqId}]` : '';
+}
+
 function log(level, msg, data) {
   if ((LOG_LEVELS[level] ?? 1) < minLevel) return;
   const ts = new Date().toISOString();
   const extra = data ? ' ' + JSON.stringify(data) : '';
-  const line = `[${ts}] [${level}] ${msg}${extra}`;
+  const line = `[${ts}] [${level}]${reqTag()} ${msg}${extra}`;
   console.error(line);
   try { getLogFile().write(line + '\n'); } catch {}
 }
@@ -110,7 +121,7 @@ function log(level, msg, data) {
 function logError(msg, error) {
   const ts = new Date().toISOString();
   const stack = error?.stack || error?.message || String(error);
-  const line = `[${ts}] [error] ${msg}\n${stack}`;
+  const line = `[${ts}] [error]${reqTag()} ${msg}\n${stack}`;
   console.error(line);
   try { getLogFile().write(line + '\n'); } catch {}
 }
@@ -421,75 +432,124 @@ async function forwardToCCViaProxy(body, apiKey, signal) {
 
     tlsSocket.on('error', reject);
 
-    // Collect the response as a stream-like object for compatibility with existing handlers
-    const chunks = [];
+    // Collect the response as a stream-like object for compatibility with existing handlers.
+    // Handles chunked transfer-encoding: without decoding, hex chunk-size markers leak
+    // into the NDJSON body and corrupt the event stream (visible as "11" lines).
+    let headerBuf = Buffer.alloc(0);
     let headersParsed = false;
-    let responseData = '';
+    let errorBody = null;      // accumulating full body for non-2xx
+    let errorTimer = null;
+
+    const enqueueBody = (ctrl) => (buf) => { try { ctrl.enqueue(buf); } catch {} };
 
     tlsSocket.on('data', (chunk) => {
       if (!headersParsed) {
-        responseData += chunk.toString();
-        const headerEnd = responseData.indexOf('\r\n\r\n');
-        if (headerEnd >= 0) {
-          headersParsed = true;
-          const statusLine = responseData.split('\r\n')[0];
-          const statusCode = parseInt(statusLine.split(' ')[1]) || 500;
-          const bodyData = responseData.slice(headerEnd + 4);
+        headerBuf = Buffer.concat([headerBuf, chunk]);
+        const headerEnd = headerBuf.indexOf('\r\n\r\n');
+        if (headerEnd < 0) return;
+        headersParsed = true;
+        const headerText = headerBuf.slice(0, headerEnd).toString('latin1');
+        const headerLines = headerText.split('\r\n');
+        const statusCode = parseInt(headerLines[0].split(' ')[1]) || 500;
+        const respHeaders = {};
+        for (const h of headerLines.slice(1)) {
+          const i = h.indexOf(':');
+          if (i > 0) respHeaders[h.slice(0, i).trim().toLowerCase()] = h.slice(i + 1).trim();
+        }
+        let bodyStart = headerBuf.slice(headerEnd + 4);
+        headerBuf = null;
 
-          if (statusCode < 200 || statusCode >= 300) {
-            // Non-2xx: return as error response
-            resolve({
-              ok: false,
-              status: statusCode,
-              body: {
-                getReader() {
-                  const encoder = new TextEncoder();
-                  const encoded = encoder.encode(bodyData);
-                  let read = false;
-                  return {
-                    read() {
-                      if (!read) { read = true; return Promise.resolve({ done: false, value: encoded }); }
-                      return Promise.resolve({ done: true });
-                    }
-                  };
-                },
-                text() { return Promise.resolve(bodyData); },
-              },
-              text() { return Promise.resolve(bodyData); },
-            });
-            return;
-          }
-
-          // Streaming response: create a ReadableStream from the socket
-          let streamClosed = false;
-          const stream = new ReadableStream({
-            start(ctrl) {
-              if (bodyData) ctrl.enqueue(new TextEncoder().encode(bodyData));
-              tlsSocket.on('data', (chunk) => {
-                if (!streamClosed) {
-                  try { ctrl.enqueue(chunk); } catch {}
-                }
-              });
-              tlsSocket.on('end', () => { streamClosed = true; try { ctrl.close(); } catch {} });
-              tlsSocket.on('error', (e) => { streamClosed = true; try { ctrl.error(e); } catch {} });
+        if (statusCode < 200 || statusCode >= 300) {
+          // Non-2xx: accumulate the FULL error body (up to 5s safety), then resolve.
+          // Subsequent bytes arrive via the main data listener's errorBody branch.
+          errorBody = [bodyStart];
+          errorTimer = setTimeout(() => {
+            if (errorBody) {
+              const text = Buffer.concat(errorBody).toString('utf8');
+              errorBody = null;
+              resolve({ ok: false, status: statusCode, text: () => Promise.resolve(text), body: { getReader() { return emptyReader(); } } });
+            }
+          }, 5000);
+          tlsSocket.on('end', () => {
+            if (errorBody) {
+              clearTimeout(errorTimer);
+              const text = Buffer.concat(errorBody).toString('utf8');
+              errorBody = null;
+              resolve({ ok: false, status: statusCode, text: () => Promise.resolve(text), body: { getReader() { return emptyReader(); } } });
             }
           });
-
-          resolve({
-            ok: true,
-            status: statusCode,
-            body: {
-              getReader() { return stream.getReader(); },
-            },
-          });
+          return;
         }
+
+        // Streaming 2xx: build a byte-accurate body stream
+        const isChunked = /chunked/i.test(respHeaders['transfer-encoding'] || '');
+        let streamClosed = false;
+        const stream = new ReadableStream({
+          start(ctrl) {
+            const emit = enqueueBody(ctrl);
+            let chunkDecoder = null;
+            if (isChunked) {
+              let pending = Buffer.alloc(0);
+              let state = 'size', remaining = 0;
+              const feed = () => {
+                if (streamClosed) return;
+                let progressed = true;
+                while (progressed) {
+                  progressed = false;
+                  if (state === 'size') {
+                    const idx = pending.indexOf('\r\n');
+                    if (idx >= 0) {
+                      const sizeLine = pending.slice(0, idx).toString('latin1').split(';')[0].trim();
+                      pending = pending.slice(idx + 2);
+                      remaining = parseInt(sizeLine, 16);
+                      if (isNaN(remaining)) { state = 'done'; break; }
+                      state = remaining === 0 ? 'done' : 'data';
+                      progressed = true;
+                    }
+                  } else if (state === 'data') {
+                    if (pending.length >= remaining + 2) { // chunk data + trailing CRLF
+                      emit(pending.slice(0, remaining));
+                      pending = pending.slice(remaining + 2);
+                      remaining = 0;
+                      state = 'size';
+                      progressed = true;
+                    }
+                  }
+                }
+              };
+              chunkDecoder = {
+                push(c) { pending = Buffer.concat([pending, c]); feed(); },
+              };
+            }
+            const pushBody = (c) => { if (chunkDecoder) chunkDecoder.push(c); else emit(c); };
+            if (bodyStart.length) pushBody(bodyStart);
+            tlsSocket.on('data', (c) => { if (!streamClosed) pushBody(c); });
+            tlsSocket.on('end', () => { streamClosed = true; try { ctrl.close(); } catch {} });
+            tlsSocket.on('error', (e) => { streamClosed = true; try { ctrl.error(e); } catch {} });
+          },
+        });
+
+        resolve({
+          ok: true,
+          status: statusCode,
+          body: {
+            getReader() { return stream.getReader(); },
+          },
+        });
+      } else if (errorBody) {
+        errorBody.push(chunk);
       }
+      // (streaming body bytes are forwarded via the listener registered above)
     });
 
     tlsSocket.on('end', () => {
       if (!headersParsed) reject(new Error('Connection closed before response headers'));
     });
   });
+}
+
+function emptyReader() {
+  return { read() { return Promise.resolve({ done: true }); } };
 }
 
 function randomUUID() { return crypto.randomUUID(); }
@@ -885,6 +945,7 @@ async function collectCcStream(reader) {
   let inReasoning = false, timedOut = false;
   const toolCalls = [];
   const toolById = new Map();
+  const seenUnknown = new Set(); // log each unknown event type once per request
   let cur = null; // tool call being accumulated from tool-input-* events
 
   const addTool = (id, name, args) => {
@@ -936,7 +997,20 @@ async function collectCcStream(reader) {
             break;
           case 'error':
             text += '[ERROR: ' + (ev.error?.message || 'CC API error') + ']';
+            log('warn', `Upstream stream error event: ${ev.error?.message || 'CC API error'}`);
             break;
+          case 'tool-error':
+            log('warn', `Upstream tool error event: ${ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 150)}`);
+            break;
+          // Known signal events — no data to collect, nothing to report
+          case 'start': case 'start-step': case 'text-start': case 'text-end':
+          case 'text-start-step': case 'provider-metadata':
+            break;
+          default: {
+            const t = ev.type || '(no type)';
+            if (!seenUnknown.has(t)) { seenUnknown.add(t); log('warn', `Unknown CC event type: ${t} (data: ${line.slice(0, 150)})`); }
+            break;
+          }
         }
       }
     }
@@ -987,6 +1061,7 @@ function createOpenAiTranslator(completionId, model) {
   let inputTokens = 0, outputTokens = 0, cachedTokens = 0, roleSent = false;
   let toolCallIndex = 0, currentToolId = '', currentToolName = '', currentToolArgs = '';
   const emittedToolIds = new Set();
+  const seenUnknown = new Set(); // log each unknown event type once per request
 
   const base = () => ({ id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model });
 
@@ -1018,7 +1093,10 @@ function createOpenAiTranslator(completionId, model) {
         // content — clients show it as thinking instead of polluting the answer.
         const text = ev.text || '';
         if (text) chunks.push({ ...base(), choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }] });
-      } else if (type === 'text-end' || type === 'reasoning-end') {}
+      } else if (type === 'text-end' || type === 'reasoning-end' || type === 'provider-metadata') {}
+      else if (type === 'tool-error') {
+        log('warn', `Upstream tool error event: ${ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 150)}`);
+      }
       // Tool call events from CC API
       else if (type === 'tool-input-start') {
         currentToolId = ev.id || '';
@@ -1040,11 +1118,15 @@ function createOpenAiTranslator(completionId, model) {
         cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
+        log('warn', `Upstream stream error event: ${msg}`);
         chunks.push({ ...base(), choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
       } else if (type === 'finish') {
         const fr = ev.finishReason === 'length' ? 'length' : ev.finishReason === 'tool-calls' ? 'tool_calls' : 'stop';
         chunks.push({ ...base(), choices: [{ index: 0, delta: {}, finish_reason: fr }], usage: { prompt_tokens: inputTokens, completion_tokens: outputTokens, total_tokens: inputTokens + outputTokens, prompt_tokens_details: { cached_tokens: cachedTokens } } });
         recordTokens(model, inputTokens, outputTokens);
+      } else {
+        // Unknown upstream event type — protocol may have drifted; log once per type
+        if (!seenUnknown.has(type)) { seenUnknown.add(type); log('warn', `Unknown CC event type: ${type} (data: ${line.slice(0, 150)})`); }
       }
     }
     return chunks;
@@ -1061,6 +1143,7 @@ function createAnthropicTranslator(messageId, model) {
   let currentThinkingText = '';
   let currentToolId = '', currentToolName = '', currentToolArgs = '';
   const emittedToolIds = new Set();
+  const seenUnknown = new Set(); // log each unknown event type once per request
   let stopReason = 'end_turn';
 
   // Close the open block (if any). Thinking blocks get a signature_delta before
@@ -1151,10 +1234,17 @@ function createAnthropicTranslator(messageId, model) {
                    : ev.finishReason === 'length' ? 'max_tokens' : 'end_turn';
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
+        log('warn', `Upstream stream error event: ${msg}`);
         events.push(...closeBlock());
         events.push({ event: 'error', data: { type: 'error', error: { type: 'internal_error', message: msg } } });
+      } else if (type === 'tool-error') {
+        log('warn', `Upstream tool error event: ${ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 150)}`);
+      } else if (type === 'start-step' || type === 'text-start' || type === 'reasoning-start' || type === 'text-end' || type === 'reasoning-end' || type === 'provider-metadata') {
+        // Known signal events — no user-visible data
+      } else {
+        // Unknown upstream event type — protocol may have drifted; log once per type
+        if (!seenUnknown.has(type)) { seenUnknown.add(type); log('warn', `Unknown CC event type: ${type} (data: ${line.slice(0, 150)})`); }
       }
-      // start-step / text-start / reasoning-start / text-end / reasoning-end / tool-error: no user-visible data
     }
     return events;
   }
@@ -1186,6 +1276,7 @@ function createResponsesTranslator(responseId, model) {
   let textContent = '', reasoningText = '';
   let currentToolId = '', currentToolName = '', currentToolArgs = '';
   const emittedToolIds = new Set();
+  const seenUnknown = new Set(); // log each unknown event type once per request
 
   function responseObj(status) {
     return { id: responseId, object: 'response', created_at: nowUnix(), model, status, output: status === 'completed' ? outputItems : [] };
@@ -1279,8 +1370,11 @@ function createResponsesTranslator(responseId, model) {
         const u = ev.usage || {};
         inputTokens = u.inputTokens || 0; outputTokens = u.outputTokens || 0;
         cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
+      } else if (type === 'finish') {
+        // Stream end signal; response.completed is emitted by finalize()
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
+        log('warn', `Upstream stream error event: ${msg}`);
         // Surface as output text so the client sees the failure, stream still completes
         if (openKind !== 'text') {
           openItem(events, 'text', { id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', role: 'assistant', content: [] });
@@ -1288,8 +1382,14 @@ function createResponsesTranslator(responseId, model) {
         }
         textContent += '[ERROR: ' + msg + ']';
         events.push({ event: 'response.output_text.delta', data: { type: 'response.output_text.delta', item_id: openItemId, output_index: outputIndex, content_index: 0, delta: '[ERROR: ' + msg + ']' } });
+      } else if (type === 'tool-error') {
+        log('warn', `Upstream tool error event: ${ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 150)}`);
+      } else if (type === 'start-step' || type === 'text-start' || type === 'reasoning-start' || type === 'text-end' || type === 'reasoning-end' || type === 'provider-metadata') {
+        // Known signal events — no user-visible data
+      } else {
+        // Unknown upstream event type — protocol may have drifted; log once per type
+        if (!seenUnknown.has(type)) { seenUnknown.add(type); log('warn', `Unknown CC event type: ${type} (data: ${line.slice(0, 150)})`); }
       }
-      // start-step / text-start / reasoning-start / text-end / reasoning-end / tool-error: no user-visible data
     }
     return events;
   }
@@ -1875,11 +1975,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.27', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.28', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.27', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.28', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -1986,13 +2086,35 @@ async function handleApiTest(req, res) {
 
 const startTime = Date.now();
 
-const server = http.createServer(async (req, res) => {
-  // CORS
+const server = http.createServer((req, res) => {
+  const reqId = newReqId();
+  const reqStart = Date.now();
+  // CORS (outside request context — nothing to correlate)
   if (req.method === 'OPTIONS') {
     res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Api-Key' });
     return res.end();
   }
 
+  requestStore.run({ reqId }, () => {
+    const urlPath = (req.url || '').split('?')[0];
+    const isGatewayRoute = urlPath.startsWith('/v1/') || urlPath === '/health';
+    res.on('finish', () => {
+      if (isGatewayRoute) log('info', `Request done: ${req.method} ${urlPath} ${res.statusCode} in ${Date.now() - reqStart}ms`);
+    });
+    res.on('close', () => {
+      // Client hung up before the response was fully sent (common for agent aborts)
+      if (!res.writableEnded && isGatewayRoute) log('warn', `Client disconnected early: ${req.method} ${urlPath} after ${Date.now() - reqStart}ms, sent ${res.writableLength} buffered bytes`);
+    });
+    handleRequest(req, res).catch(e => {
+      log('error', `Unhandled handler error: ${e.message}`);
+      if (e.stack) log('error', e.stack);
+      if (!res.headersSent) jsonRes(res, 500, { error: { message: 'Internal server error', type: 'server_error' } });
+      else res.end();
+    });
+  });
+});
+
+async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   try {
@@ -2016,7 +2138,7 @@ const server = http.createServer(async (req, res) => {
     if (!res.headersSent) jsonRes(res, 500, { error: { message: 'Internal server error', type: 'server_error' } });
     else res.end();
   }
-});
+}
 
 // ── Global Error Handlers (prevent process crash) ──────────────────────
 process.on('uncaughtException', (err) => {
@@ -2050,7 +2172,7 @@ async function start() {
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
-    console.log(`\n  cc-gateway v1.0.27`);
+    console.log(`\n  cc-gateway v1.0.28`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
