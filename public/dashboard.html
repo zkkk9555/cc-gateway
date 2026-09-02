@@ -73,6 +73,17 @@ button.ghost{background:#fff;border:1px solid var(--border);color:var(--text)}
 <h2>状态总览</h2>
 <div class="cards" id="overview" style="grid-template-columns:repeat(4,1fr)"></div>
 
+<!-- API Key 池管理 -->
+<h2>API Key 池 <span class="tag">轮询 + 自动故障转移 · 修改即时生效并保存到 config.json（明文）</span></h2>
+<table id="keys-table" style="margin-bottom:12px">
+  <thead><tr><th>Key</th><th style="width:110px">状态</th><th style="width:70px">失败</th><th style="width:200px">最近错误</th><th style="width:250px">操作</th></tr></thead>
+  <tbody id="keys-body"></tbody>
+</table>
+<div class="row" style="margin-bottom:6px">
+  <input id="new-key" class="grow" placeholder="粘贴新的 API Key（user_ 开头），回车或点添加" style="padding:8px 12px;border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:13px;background:#fff">
+  <button onclick="addKey()">添加 Key</button>
+</div>
+
 <!-- Free 模型测试 -->
 <h2>Free 模型测试 <span class="tag">自动从上游模型表筛选含 free 标签的模型，逐个发 ping 测试</span></h2>
 <div class="row" style="margin-bottom:12px"><button id="btn-test-all">一键测试全部 Free 模型</button><span class="sub" id="test-all-status" style="margin:0"></span></div>
@@ -256,9 +267,56 @@ async function refreshStatus(){
     <tr><td>Anthropic 兼容（Messages）<br><span style="color:var(--dim);font-size:12px">Claude Code</span></td><td style="font-family:var(--mono);word-break:break-all">${base}<button class="copy-btn" onclick="copyText('${base}')">复制</button></td><td style="font-family:var(--mono)">${s.key}<button class="copy-btn" onclick="copyText('${s.key}')">复制</button></td></tr>`;
 }
 
+// ---- Key pool management ----
+async function keyAction(path,key){
+  try{
+    const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key})});
+    const d=await r.json();
+    if(d.error){toast(d.error,"bad");return false}
+    return d;
+  }catch(e){toast("请求失败: "+e,"bad");return false}
+}
+async function addKey(){
+  const k=$("new-key").value.trim();
+  if(!k.startsWith("user_")){toast("Key 必须以 user_ 开头","bad");return}
+  if(await keyAction("/api/keys/add",k)){$("new-key").value="";toast("Key 已添加并即时生效","ok")}
+}
+async function removeKey(k){
+  if(!confirm("确定从池中删除该 Key？"))return;
+  if(await keyAction("/api/keys/remove",k))toast("Key 已删除","ok");
+}
+async function enableKey(k){
+  if(await keyAction("/api/keys/enable",k))toast("Key 已重新启用","ok");
+}
+async function testKey(k){
+  toast("正在测试 "+k.slice(0,9)+"…","warn");
+  try{
+    const r=await fetch("/api/keys/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});
+    const d=await r.json();
+    toast(d.ok?`✓ Key 可用 (${d.ms}ms)`:"✗ 测试失败: "+(d.error||"未知"),d.ok?"ok":"bad");
+  }catch(e){toast("测试请求失败: "+e,"bad")}
+}
+async function loadKeys(){
+  const d=await api("/api/keys");
+  const keys=d.keys||[];
+  $("keys-body").innerHTML=keys.map(k=>`
+    <tr>
+      <td style="font-family:var(--mono);word-break:break-all">${k.key}</td>
+      <td><span class="badge ${k.status==="ok"?"ok":k.status==="cooldown"?"warn":"bad"}">${k.status}</span></td>
+      <td>${k.failures||0}</td>
+      <td style="color:var(--dim);font-size:12px">${k.last_error||"—"}</td>
+      <td style="white-space:nowrap">
+        <button class="ghost" onclick="testKey('${k.key}')">测试</button>
+        ${k.status==="disabled"?`<button class="ghost" onclick="enableKey('${k.key}')">启用</button>`:""}
+        <button class="ghost" onclick="removeKey('${k.key}')">删除</button>
+      </td>
+    </tr>`).join("")||'<tr><td colspan="5" style="color:var(--dim)">池内没有 Key，请在下方输入并添加</td></tr>';
+}
+$("new-key").addEventListener("keydown",e=>{if(e.key==="Enter")addKey()});
+
 // ---- Main refresh loop ----
 async function refresh(){
-  await Promise.all([refreshStatus(),refreshUsage(),refreshLogs()]);
+  await Promise.all([refreshStatus(),refreshUsage(),refreshLogs(),loadKeys()]);
 }
 
 refresh();

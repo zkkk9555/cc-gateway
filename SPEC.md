@@ -82,6 +82,28 @@ config.json 支持多 Key 聚合（类似 New API / sub2api 的 key 池）：
 - 每个 key 独立维护设备指纹与会话（`keyStates`/`sessions` 按 key 隔离），指纹预请求各自触发
 - `/api/status` 的 `key_pool` 字段与 dashboard「Key 池」卡片实时展示各 key 状态（ok / cooldown / disabled）
 
+### 管理页面图形化管理（v1.030）
+
+Dashboard「API Key 池」面板支持完整的图形化管理，**修改即时生效并明文持久化到 config.json**（无需重启、无需改配置文件）：
+
+- **列表**：每个 key 的明文、状态徽章（ok / cooldown / disabled）、失败次数、最近错误
+- **添加**：输入框 + 「添加 Key」按钮（或回车）；格式校验 `user_` 前缀 + 字母/数字/_/-
+- **删除**：每行「删除」按钮（带 confirm 确认）
+- **测试**：每行「测试」按钮——用该 key 单独向上游发一个 ping 请求，返回可用性与耗时（新加 key 验证首选）
+- **启用**：被摘除（401）的 key 可一键重新启用，无需重启
+
+管理 API（供面板与脚本调用）：
+
+| 端点 | 方法 | 说明 |
+|---|---|---|
+| `/api/keys` | GET | 池详情（明文 key + 状态） |
+| `/api/keys/add` | POST | `{key}` 添加并持久化 |
+| `/api/keys/remove` | POST | `{key}` 删除并持久化 |
+| `/api/keys/enable` | POST | `{key}` 清除摘除/冷却/失败状态 |
+| `/api/keys/test` | POST | `{key}` 单 key 连通性测试（deepseek ping，20s 超时） |
+
+安全说明：管理 API 与 key 明文无鉴权（按运营者自用设计）。网关默认绑定 0.0.0.0，若部署在不可信局域网请改 `host: 127.0.0.1` 或加防火墙规则。
+
 ## API 端点
 
 ### 1. `POST /v1/chat/completions` — OpenAI Chat Completions

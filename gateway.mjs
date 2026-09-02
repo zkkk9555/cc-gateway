@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.29
+  console.log(`cc-gateway v1.0.30
 Usage:
   node gateway.mjs                    Start the gateway
   node gateway.mjs --set-key          Set primary API key interactively
@@ -37,7 +37,7 @@ Usage:
   node gateway.mjs --help             Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.29'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.30'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -364,20 +364,53 @@ function poolDisable(key, reason = 'auth_failed') {
   log('error', `Key ${key.slice(0, 8)}… DISABLED from pool (${reason}). Restart or --remove-key to clear.`);
 }
 
-function poolStatus() {
+function poolStatus(reveal = false) {
   return {
     total: keyPool.keys.length,
     healthy: poolActiveCount(),
     keys: keyPool.keys.map(k => {
       const h = keyHealth(k);
       return {
-        key: `${k.slice(0, 8)}…${k.slice(-4)}`,
+        key: reveal ? k : `${k.slice(0, 8)}…${k.slice(-4)}`,
         status: h.disabled ? 'disabled' : (Date.now() < h.cooldownUntil ? 'cooldown' : 'ok'),
         failures: h.failures,
         last_error: h.lastError,
       };
     }),
   };
+}
+
+// Live pool mutations (dashboard management) — update the running pool AND
+// persist to config.json so the state survives restarts. Plaintext by design.
+function poolAddKey(key) {
+  key = (key || '').trim();
+  if (!/^user_[a-zA-Z0-9_-]{8,}$/.test(key)) return { ok: false, error: 'Key 格式无效：需 user_ 开头，仅含字母/数字/_/-' };
+  if (keyPool.keys.includes(key)) return { ok: false, error: '该 Key 已在池中' };
+  keyPool.keys.push(key);
+  if (!Array.isArray(CFG.api_keys)) CFG.api_keys = [];
+  if (!CFG.api_keys.includes(key)) CFG.api_keys.push(key);
+  if (!CFG.api_key) CFG.api_key = key;
+  saveConfig(CFG);
+  return { ok: true };
+}
+
+function poolRemoveKey(key) {
+  const i = keyPool.keys.indexOf(key);
+  if (i < 0) return { ok: false, error: '该 Key 不在池中' };
+  keyPool.keys.splice(i, 1);
+  keyPool.health.delete(key);
+  if (Array.isArray(CFG.api_keys)) CFG.api_keys = CFG.api_keys.filter(k => k !== key);
+  if (CFG.api_key === key) CFG.api_key = CFG.api_keys[0] || '';
+  if (keyPool.rr >= keyPool.keys.length) keyPool.rr = 0;
+  saveConfig(CFG);
+  return { ok: true };
+}
+
+function poolEnableKey(key) {
+  if (!keyPool.keys.includes(key)) return { ok: false, error: '该 Key 不在池中' };
+  const h = keyHealth(key);
+  h.disabled = false; h.cooldownUntil = 0; h.failures = 0; h.lastError = null;
+  return { ok: true };
 }
 
 // Per-request key selector: first pick = round-robin (load distribution),
@@ -2170,11 +2203,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.29', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.30', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.29', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.30', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -2223,6 +2256,80 @@ function handleApiLogs(req, res) {
 function handleApiModels(req, res) {
   const freeModels = (cachedModels || []).filter(m => /free/i.test(m.id));
   jsonRes(res, 200, { models: freeModels, total: freeModels.length, all_count: (cachedModels || []).length });
+}
+
+// ── Key pool management API (dashboard) ─────────────────────────────────────
+// Plaintext keys by explicit user decision — instance is operator-owned.
+
+function handleApiKeys(req, res) {
+  jsonRes(res, 200, poolStatus(true));
+}
+
+async function handleApiKeyAdd(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
+  const r = poolAddKey(body.key);
+  if (!r.ok) return jsonRes(res, 400, { error: r.error });
+  log('info', `Key added via dashboard: ${body.key.trim().slice(0, 8)}… (pool ${keyPool.keys.length} keys)`);
+  jsonRes(res, 200, poolStatus(true));
+}
+
+async function handleApiKeyRemove(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
+  const r = poolRemoveKey(body.key);
+  if (!r.ok) return jsonRes(res, 400, { error: r.error });
+  log('info', `Key removed via dashboard (pool ${keyPool.keys.length} keys)`);
+  jsonRes(res, 200, poolStatus(true));
+}
+
+async function handleApiKeyEnable(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
+  const r = poolEnableKey(body.key);
+  if (!r.ok) return jsonRes(res, 400, { error: r.error });
+  log('info', `Key re-enabled via dashboard: ${body.key.slice(0, 8)}…`);
+  jsonRes(res, 200, poolStatus(true));
+}
+
+async function handleApiKeyTest(req, res) {
+  let body;
+  try { body = JSON.parse(await readBody(req)); } catch { return jsonRes(res, 400, { error: 'Invalid JSON' }); }
+  const key = (body.key || '').trim();
+  if (!key.startsWith('user_')) return jsonRes(res, 400, { error: 'Invalid key' });
+  const model = 'deepseek/deepseek-v4-flash'; // cheap probe via the direct route
+  const start = Date.now();
+  try {
+    const testBody = buildCcRequest({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 5, stream: true });
+    const ccRes = await forwardToCC(testBody, key);
+    if (!ccRes.ok) {
+      const errText = await ccRes.text().catch(() => '');
+      const { message } = parseUpstreamError(errText, ccRes.status);
+      return jsonRes(res, 200, { ok: false, ms: Date.now() - start, status: ccRes.status, error: message.slice(0, 200) });
+    }
+    const reader = ccRes.body.getReader();
+    const decoder = new TextDecoder();
+    const deadline = Date.now() + 20000;
+    let finished = false, buffer = '';
+    while (!finished && Date.now() < deadline) {
+      const { done, value } = await Promise.race([
+        reader.read(),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), Math.max(deadline - Date.now(), 1))),
+      ]);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { if (JSON.parse(line).type === 'finish') finished = true; } catch {}
+      }
+    }
+    reader.cancel().catch(() => {});
+    jsonRes(res, 200, { ok: true, ms: Date.now() - start, status: 200 });
+  } catch (e) {
+    jsonRes(res, 200, { ok: false, ms: Date.now() - start, status: 0, error: e.message });
+  }
 }
 
 async function handleApiTest(req, res) {
@@ -2321,6 +2428,11 @@ async function handleRequest(req, res) {
     if (url.pathname === '/api/logs' && req.method === 'GET') return handleApiLogs(req, res);
     if (url.pathname === '/api/models' && req.method === 'GET') return handleApiModels(req, res);
     if (url.pathname === '/api/test' && req.method === 'POST') return handleApiTest(req, res);
+    if (url.pathname === '/api/keys' && req.method === 'GET') return handleApiKeys(req, res);
+    if (url.pathname === '/api/keys/add' && req.method === 'POST') return handleApiKeyAdd(req, res);
+    if (url.pathname === '/api/keys/remove' && req.method === 'POST') return handleApiKeyRemove(req, res);
+    if (url.pathname === '/api/keys/enable' && req.method === 'POST') return handleApiKeyEnable(req, res);
+    if (url.pathname === '/api/keys/test' && req.method === 'POST') return handleApiKeyTest(req, res);
 
     // Gateway routes
     if (url.pathname === '/health' && req.method === 'GET') return handleHealth(req, res);
@@ -2368,7 +2480,7 @@ async function start() {
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key_pool: `${poolActiveCount()}/${keyPool.keys.length} healthy` });
-    console.log(`\n  cc-gateway v1.0.29`);
+    console.log(`\n  cc-gateway v1.0.30`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
