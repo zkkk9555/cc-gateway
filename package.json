@@ -1,6 +1,6 @@
 {
   "name": "cc-gateway",
-  "version": "1.0.26",
+  "version": "1.0.27",
   "type": "module",
   "description": "Command Code API Gateway - translates CC CLI protocol to standard API formats",
   "engines": { "node": ">=22.0.0" }

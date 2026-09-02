@@ -334,12 +334,13 @@ CC 上游可能以两种事件序列发出工具调用，翻译器两者都支�
 
 ## 错误处理
 
-- CC 上游 **任何瞬态错误**（HTTP 429/5xx 或流内可重试的 `[ERROR: ...]`）→ 进入 **120 秒重试窗口**，不断重试直到成功或超时。**三种 API 模式均支持**（v1.026 起流式 + 非流式路径全覆盖）
+- CC 上游 **任何瞬态错误**（HTTP 429/5xx、流内可重试的 `[ERROR: ...]`、**连接级失败**如 SOCKS5/TLS 断连）→ 进入 **120 秒重试窗口**，不断重试直到成功或超时。**三种 API 模式均支持**（v1.026 起流式 + 非流式路径全覆盖；v1.027 起连接级失败也纳入窗口）
 - **永久性错误不重试**（v1.026）：HTTP 4xx（429 除外）及流内校验类错误（`invalid` / `must not be` / `not found` 等）→ 立即返回 400/原状态码，避免空转 120 秒
 - CC 上游 401/403 → 立即返回认证错误（不重试，鉴权失败重试无意义）
 - 零输出 token → 原样透传空内容（usage 为 0，防止虚假计费）
 - **流式超时**：`stream_timeout_ms`（默认120s）为正常超时；当检测到 `reasoning-start` 事件时，自动切换到 `reasoning_timeout_ms`（默认300s = 5分钟），推理结束后恢复。推理型模型（如 `meta/muse-spark`）内部思考时不发 NDJSON 事件，必须用更长超时。
 - 重试窗口耗尽仍失败 → 返回 503 `Service unavailable after N retries (120s)`
+- **上游流异常终止**（连接中断且未发 finish 事件）→ Chat 流合成 `finish_reason: stop` 后再发 `[DONE]`（v1.027），保证客户端循环正常终止；Anthropic/Responses 的 finalize 事件本就总是发送
 - 上游错误体（如 `{"success":false,"error":{"code":"MODEL_NOT_IN_PLAN","message":"..."}}`）会被解析成干净的结构化错误返回（v1.025），`MODEL_NOT_IN_PLAN` 表示该模型不在当前套餐内（如 muse-spark-1.2 需 GOAT 套餐、1.1 需 Pro 套餐；`meta/muse-spark-1.2-contributor` 在普通套餐可用）
 
 ## 日志格式

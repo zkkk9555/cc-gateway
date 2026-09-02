@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.26
+  console.log(`cc-gateway v1.0.27
 Usage:
   node gateway.mjs              Start the gateway
   node gateway.mjs --set-key    Set API key interactively
@@ -33,7 +33,7 @@ Usage:
   node gateway.mjs --help       Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.26'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.27'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -1339,7 +1339,18 @@ async function handleChatCompletions(req, res) {
       }
       attempt++;
 
-      const ccRes = await forwardToCC(ccBody, apiKey);
+      let ccRes;
+      try {
+        ccRes = await forwardToCC(ccBody, apiKey);
+      } catch (connErr) {
+        // Connection-level failure (SOCKS5/TLS/timeout) rides the same 120s window
+        if (Date.now() >= RETRY_DEADLINE) {
+          log('error', `Connection failed after retry window for ${model}: ${connErr.message}`);
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${connErr.message}`, type: 'proxy_error' } });
+        }
+        log('warn', `Connection error on ${model} (/v1/chat/completions), retrying: ${connErr.message}`);
+        continue;
+      }
       if (!ccRes.ok) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
@@ -1439,6 +1450,7 @@ async function handleChatCompletions(req, res) {
       // Phase 2: Commit — send headers + pre-buffered chunks, then stream the rest
       sseHeaders(res);
       for (const chunk of preHeadersChunks) sseData(res, chunk);
+      let finishSent = preHeadersChunks.some(c => c.choices?.[0]?.finish_reason);
 
       let streamTimedOut = false;
       let inReasoning = false;
@@ -1455,7 +1467,10 @@ async function handleChatCompletions(req, res) {
             else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
           }
           const chunks = translate(lines);
-          for (const chunk of chunks) sseData(res, chunk);
+          for (const chunk of chunks) {
+            if (chunk.choices?.[0]?.finish_reason) finishSent = true;
+            sseData(res, chunk);
+          }
         }
       } catch (e) {
         if (e.message === 'Stream read timeout') {
@@ -1468,7 +1483,10 @@ async function handleChatCompletions(req, res) {
       }
       if (buffer.trim()) {
         const chunks = translate([buffer]);
-        for (const chunk of chunks) sseData(res, chunk);
+        for (const chunk of chunks) {
+          if (chunk.choices?.[0]?.finish_reason) finishSent = true;
+          sseData(res, chunk);
+        }
       }
 
       if (streamTimedOut) {
@@ -1476,6 +1494,12 @@ async function handleChatCompletions(req, res) {
         res.write(`data: ${JSON.stringify({id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{index: 0, delta: {content: `[ERROR: Upstream timeout — no response for ${timeoutS}s${inReasoning ? ' (reasoning phase)' : ''}]`}, finish_reason: 'stop'}]})}\n\n`);
         res.write('data: [DONE]\n\n');
       } else {
+        // Upstream stream ended without a finish event (abnormal termination) —
+        // synthesize one so client loops terminate cleanly
+        if (!finishSent) {
+          log('warn', `Upstream stream ended without finish event on ${model}, synthesizing stop`);
+          res.write(`data: ${JSON.stringify({id: completionId, object: 'chat.completion.chunk', created: nowUnix(), model, choices: [{index: 0, delta: {}, finish_reason: 'stop'}]})}\n\n`);
+        }
         res.write('data: [DONE]\n\n');
       }
       res.end();
@@ -1513,7 +1537,17 @@ async function handleMessages(req, res) {
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/messages, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
-      const ccRes = await forwardToCC(ccBody, apiKey);
+      let ccRes;
+      try {
+        ccRes = await forwardToCC(ccBody, apiKey);
+      } catch (connErr) {
+        if (Date.now() >= RETRY_DEADLINE) {
+          log('error', `Connection failed after retry window for ${model}: ${connErr.message}`);
+          return jsonRes(res, 503, { type: 'error', error: { type: 'api_error', message: `Service unavailable after ${attempt} retries (120s): ${connErr.message}` } });
+        }
+        log('warn', `Connection error on ${model} (/v1/messages), retrying: ${connErr.message}`);
+        continue;
+      }
       if (!ccRes.ok) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
@@ -1661,7 +1695,17 @@ async function handleResponses(req, res) {
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/responses, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
-      const ccRes = await forwardToCC(ccBody, apiKey);
+      let ccRes;
+      try {
+        ccRes = await forwardToCC(ccBody, apiKey);
+      } catch (connErr) {
+        if (Date.now() >= RETRY_DEADLINE) {
+          log('error', `Connection failed after retry window for ${model}: ${connErr.message}`);
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${connErr.message}`, type: 'proxy_error' } });
+        }
+        log('warn', `Connection error on ${model} (/v1/responses), retrying: ${connErr.message}`);
+        continue;
+      }
       if (!ccRes.ok) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
@@ -1831,11 +1875,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.26', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.27', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.26', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.27', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -2006,7 +2050,7 @@ async function start() {
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
-    console.log(`\n  cc-gateway v1.0.26`);
+    console.log(`\n  cc-gateway v1.0.27`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
