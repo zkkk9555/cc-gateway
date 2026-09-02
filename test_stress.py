@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""cc-gateway stress test — all scenarios, minimax/minimax-m3-free only."""
+"""cc-gateway stress test — all scenarios, poolside/laguna-s-2.1-free only."""
 import json, time, sys, threading, traceback
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://127.0.0.1:3050"
-MODEL = "minimax/minimax-m3-free"
+MODEL = "poolside/laguna-s-2.1-free"
 RESULTS = []
 ERRORS = []
 

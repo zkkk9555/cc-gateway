@@ -23,7 +23,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.25
+  console.log(`cc-gateway v1.0.26
 Usage:
   node gateway.mjs              Start the gateway
   node gateway.mjs --set-key    Set API key interactively
@@ -33,7 +33,7 @@ Usage:
   node gateway.mjs --help       Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.25'); process.exit(0); }
+if (args.includes('--version')) { console.log('cc-gateway v1.0.26'); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -322,6 +322,20 @@ function parseUpstreamError(errText, status) {
     if (e?.message) { message = e.message; code = e.code || j.code || null; }
   } catch { if (errText && errText.trim()) message = errText.slice(0, 500); }
   return { message, code };
+}
+
+// Deterministic client/validation errors — retrying them for 120s just hammers
+// upstream and delays the inevitable failure. Transient errors ("Service
+// temporarily unavailable", "timed out", rate limits) never match these patterns.
+const PERMANENT_ERROR_RE = /invalid|must not be|not be empty|required|unsupported|not supported|unknown model|not found|too (large|long|many|big)|exceeds|permission|denied|unauthorized|malformed/i;
+
+function isRetryableUpstreamError(message) {
+  return !PERMANENT_ERROR_RE.test(message || '');
+}
+
+// 4xx (except 429) are permanent; 429 and 5xx are transient and retried
+function isPermanentHttpStatus(status) {
+  return status >= 400 && status < 500 && status !== 429;
 }
 
 // Fake signature for Anthropic thinking blocks. Anthropic validates signatures
@@ -742,21 +756,25 @@ function convertResponsesToOpenai(responsesReq) {
     messages.push({ role: 'user', content: input });
   } else if (Array.isArray(input)) {
     for (const item of input) {
-      if (item.type === 'message') {
+      // OpenAI Responses spec: message items may omit "type" (EasyInputMessage)
+      // and content may be a plain string instead of an array
+      const itemType = item.type || (item.role ? 'message' : null);
+      if (itemType === 'message') {
+        const contentStr = typeof item.content === 'string' ? item.content
+          : (item.content || []).filter(c => c.type === 'input_text' || c.type === 'output_text').map(c => c.text).join('');
         if (item.role === 'system' || item.role === 'developer') {
-          const text = Array.isArray(item.content) ? item.content.filter(c => c.type === 'input_text').map(c => c.text).join('') : String(item.content || '');
-          if (text) messages.push({ role: 'system', content: text });
+          if (contentStr) messages.push({ role: 'system', content: contentStr });
         } else if (item.role === 'user') {
-          const text = (item.content || []).filter(c => c.type === 'input_text').map(c => c.text).join('');
-          if (text) messages.push({ role: 'user', content: text });
+          if (contentStr) messages.push({ role: 'user', content: contentStr });
         } else if (item.role === 'assistant') {
-          const text = (item.content || []).filter(c => c.type === 'output_text').map(c => c.text).join('');
-          const toolCalls = (item.content || []).filter(c => c.type === 'function_call').map(c => ({
-            id: c.call_id, type: 'function', function: { name: c.name, arguments: c.arguments || '{}' },
-          }));
-          const m = { role: 'assistant', content: text || null };
+          const toolCalls = Array.isArray(item.content)
+            ? item.content.filter(c => c.type === 'function_call').map(c => ({
+                id: c.call_id, type: 'function', function: { name: c.name, arguments: c.arguments || '{}' },
+              }))
+            : [];
+          const m = { role: 'assistant', content: contentStr || null };
           if (toolCalls.length) m.tool_calls = toolCalls;
-          messages.push(m);
+          if (contentStr || toolCalls.length) messages.push(m);
         }
       } else if (item.type === 'function_call') {
         messages.push({ role: 'assistant', content: null, tool_calls: [{ id: item.call_id, type: 'function', function: { name: item.name, arguments: item.arguments || '{}' } }] });
@@ -915,6 +933,9 @@ async function collectCcStream(reader) {
           case 'finish':
             finishReason = ev.finishReason === 'length' ? 'length'
               : (ev.finishReason === 'tool-calls' || ev.finishReason === 'tool_calls') ? 'tool_calls' : 'stop';
+            break;
+          case 'error':
+            text += '[ERROR: ' + (ev.error?.message || 'CC API error') + ']';
             break;
         }
       }
@@ -1323,8 +1344,8 @@ async function handleChatCompletions(req, res) {
         const errText = await ccRes.text().catch(() => '');
         const { message, code } = parseUpstreamError(errText, ccRes.status);
         log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-        // Auth errors (401/403) are permanent — return immediately
-        if (ccRes.status === 401 || ccRes.status === 403) {
+        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (isPermanentHttpStatus(ccRes.status)) {
           return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
         }
         // Transient upstream error (429 / 5xx) → retry within the deadline
@@ -1342,10 +1363,14 @@ async function handleChatCompletions(req, res) {
       if (openaiReq.stream === false) {
         const r = await collectCcStream(reader);
         if (r.text.startsWith('[ERROR:') && !r.toolCalls.length) {
+          const errMsg = r.text.replace(/^\[ERROR: /, '').replace(/]$/, '');
+          if (!isRetryableUpstreamError(errMsg)) {
+            return jsonRes(res, 400, { error: { message: errMsg, type: 'invalid_request_error' } });
+          }
           lastError = r.text;
           log('warn', `Transient error on ${model} (non-stream), retrying: ${r.text.slice(0, 100)}`);
           if (Date.now() >= RETRY_DEADLINE) {
-            return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${r.text.replace(/^\[ERROR: /, '').replace(/]$/, '').slice(0, 300)}`, type: 'proxy_error' } });
+            return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${errMsg.slice(0, 300)}`, type: 'proxy_error' } });
           }
           continue;
         }
@@ -1364,6 +1389,7 @@ async function handleChatCompletions(req, res) {
       let buffer = '';
       let preHeadersChunks = [];
       let earlyError = null;
+      let permanentError = null;
 
       // Read until we see content or error, then decide
       const MAX_PRE_BUFFER = 20; // max events to buffer before committing
@@ -1378,13 +1404,21 @@ async function handleChatCompletions(req, res) {
           const delta = chunk.choices?.[0]?.delta?.content || '';
           const fr = chunk.choices?.[0]?.finish_reason;
           if (delta.startsWith('[ERROR:')) {
-            earlyError = delta;
+            if (isRetryableUpstreamError(delta)) earlyError = delta;
+            else permanentError = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
           }
           preHeadersChunks.push(chunk);
           // If we got actual content or finish, stop buffering and commit
           if ((delta && !delta.startsWith('[ERROR:')) || fr) break;
         }
-        if (earlyError || (preHeadersChunks.some(c => c.choices?.[0]?.delta?.content && !c.choices[0].delta.content.startsWith('[ERROR:')))) break;
+        if (permanentError || earlyError || (preHeadersChunks.some(c => c.choices?.[0]?.delta?.content && !c.choices[0].delta.content.startsWith('[ERROR:')))) break;
+      }
+
+      // Permanent in-stream validation error — return immediately, no retry
+      if (permanentError) {
+        log('warn', `Permanent upstream error on ${model}: ${permanentError.slice(0, 100)}`);
+        reader.cancel().catch(() => {});
+        return jsonRes(res, 400, { error: { message: permanentError, type: 'invalid_request_error' } });
       }
 
       // Transient error before any real content → retry
@@ -1472,56 +1506,123 @@ async function handleMessages(req, res) {
   log('info', `Request: ${model} /v1/messages [${client}]`);
 
   try {
-    const ccRes = await forwardToCC(ccBody, apiKey);
-    if (!ccRes.ok) {
-      const errText = await ccRes.text().catch(() => '');
-      const { message, code } = parseUpstreamError(errText, ccRes.status);
-      log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { type: 'error', error: { type: 'api_error', message, ...(code ? { code } : {}) } });
-    }
-
-    // Non-streaming: collect all and return JSON
-    if (anthropicReq.stream === false) {
-      const reader = ccRes.body.getReader();
-      const r = await collectCcStream(reader);
-      const content = [];
-      if (r.reasoning) content.push({ type: 'thinking', thinking: r.reasoning, signature: fakeThinkingSignature(r.reasoning) });
-      if (r.text || !r.toolCalls.length) content.push({ type: 'text', text: r.text });
-      for (const tc of r.toolCalls) content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: safeParseJson(tc.arguments) });
-      return jsonRes(res, 200, {
-        id: messageId, type: 'message', role: 'assistant', content,
-        model, stop_reason: r.toolCalls.length ? 'tool_use' : (r.finishReason === 'length' ? 'max_tokens' : 'end_turn'), stop_sequence: null,
-        usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
-      });
-    }
-
-    sseHeaders(res);
-    const { translate, finalize } = createAnthropicTranslator(messageId, model);
-    const reader = ccRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let inReasoning = false;
+    const RETRY_DEADLINE = Date.now() + 120000; // 120s retry window for transient upstream errors
+    let attempt = 0;
 
     while (true) {
-      const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
-      const { done, value } = await readWithTimeout(reader, timeoutMs);
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const ln of lines) {
-        if (ln.includes('"reasoning-start"')) inReasoning = true;
-        else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/messages, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
+      attempt++;
+
+      const ccRes = await forwardToCC(ccBody, apiKey);
+      if (!ccRes.ok) {
+        const errText = await ccRes.text().catch(() => '');
+        const { message, code } = parseUpstreamError(errText, ccRes.status);
+        log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
+        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (isPermanentHttpStatus(ccRes.status)) {
+          return jsonRes(res, ccRes.status, { type: 'error', error: { type: 'api_error', message, ...(code ? { code } : {}) } });
+        }
+        if (Date.now() >= RETRY_DEADLINE) {
+          return jsonRes(res, 503, { type: 'error', error: { type: 'api_error', message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, ...(code ? { code } : {}) } });
+        }
+        continue;
       }
-      const events = translate(lines);
-      for (const ev of events) sseWrite(res, ev.event, ev.data);
+
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+
+      // Non-streaming: collect all and return JSON
+      if (anthropicReq.stream === false) {
+        const r = await collectCcStream(reader);
+        if (r.text.startsWith('[ERROR:') && !r.toolCalls.length) {
+          const errMsg = r.text.replace(/^\[ERROR: /, '').replace(/]$/, '');
+          if (!isRetryableUpstreamError(errMsg)) {
+            return jsonRes(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: errMsg } });
+          }
+          log('warn', `Transient error on ${model} (/v1/messages non-stream), retrying: ${r.text.slice(0, 100)}`);
+          if (Date.now() >= RETRY_DEADLINE) {
+            return jsonRes(res, 503, { type: 'error', error: { type: 'api_error', message: `Service unavailable after ${attempt} retries (120s): ${errMsg.slice(0, 300)}` } });
+          }
+          continue;
+        }
+        const content = [];
+        if (r.reasoning) content.push({ type: 'thinking', thinking: r.reasoning, signature: fakeThinkingSignature(r.reasoning) });
+        if (r.text || !r.toolCalls.length) content.push({ type: 'text', text: r.text });
+        for (const tc of r.toolCalls) content.push({ type: 'tool_use', id: tc.id, name: tc.name, input: safeParseJson(tc.arguments) });
+        return jsonRes(res, 200, {
+          id: messageId, type: 'message', role: 'assistant', content,
+          model, stop_reason: r.toolCalls.length ? 'tool_use' : (r.finishReason === 'length' ? 'max_tokens' : 'end_turn'), stop_sequence: null,
+          usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens },
+        });
+      }
+
+      // Streaming: pre-buffer initial events to detect transient in-stream errors
+      const { translate, finalize } = createAnthropicTranslator(messageId, model);
+      let buffer = '';
+      const preEvents = [];
+      let earlyError = null, hasContent = false, permanentError = null;
+      const MAX_PRE_BUFFER = 20;
+      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+        const { done, value } = await readWithTimeout(reader);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        preEvents.push(...translate(lines));
+        for (const ev of preEvents) {
+          if (ev.event === 'error') {
+            const msg = ev.data?.error?.message || 'CC API error';
+            if (isRetryableUpstreamError(msg)) earlyError = msg;
+            else permanentError = msg;
+          }
+          else if (ev.event === 'content_block_delta' && (ev.data?.delta?.type === 'text_delta' || ev.data?.delta?.type === 'thinking_delta')) hasContent = true;
+        }
+        if (permanentError || earlyError || hasContent) break;
+      }
+
+      // Permanent in-stream validation error — return immediately, no retry
+      if (permanentError) {
+        log('warn', `Permanent upstream error on ${model}: ${permanentError.slice(0, 100)}`);
+        reader.cancel().catch(() => {});
+        return jsonRes(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: permanentError } });
+      }
+
+      if (earlyError) {
+        log('warn', `Transient error on ${model} (/v1/messages), retrying: ${earlyError.slice(0, 100)}`);
+        reader.cancel().catch(() => {});
+        if (Date.now() >= RETRY_DEADLINE) {
+          return jsonRes(res, 503, { type: 'error', error: { type: 'api_error', message: `Service unavailable after ${attempt} retries (120s): ${earlyError}` } });
+        }
+        continue;
+      }
+
+      // Commit — send headers + pre-buffered events, then stream the rest
+      sseHeaders(res);
+      for (const ev of preEvents) sseWrite(res, ev.event, ev.data);
+      let inReasoning = false;
+
+      while (true) {
+        const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+        const { done, value } = await readWithTimeout(reader, timeoutMs);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const ln of lines) {
+          if (ln.includes('"reasoning-start"')) inReasoning = true;
+          else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+        }
+        const events = translate(lines);
+        for (const ev of events) sseWrite(res, ev.event, ev.data);
+      }
+      if (buffer.trim()) {
+        const events = translate([buffer]);
+        for (const ev of events) sseWrite(res, ev.event, ev.data);
+      }
+      for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
+      res.end();
+      return;
     }
-    if (buffer.trim()) {
-      const events = translate([buffer]);
-      for (const ev of events) sseWrite(res, ev.event, ev.data);
-    }
-    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
-    res.end();
   } catch (e) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
@@ -1553,56 +1654,124 @@ async function handleResponses(req, res) {
   log('info', `Request: ${model} /v1/responses [${client}]`);
 
   try {
-    const ccRes = await forwardToCC(ccBody, apiKey);
-    if (!ccRes.ok) {
-      const errText = await ccRes.text().catch(() => '');
-      const { message, code } = parseUpstreamError(errText, ccRes.status);
-      log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
-      return jsonRes(res, ccRes.status >= 500 ? 502 : ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
-    }
-
-    // Non-streaming: collect all and return JSON
-    if (responsesReq.stream === false) {
-      const reader = ccRes.body.getReader();
-      const r = await collectCcStream(reader);
-      const output = [];
-      if (r.reasoning) output.push({ id: `rs_${randomUUID().slice(0, 12)}`, type: 'reasoning', summary: [{ type: 'summary', text: r.reasoning }] });
-      if (r.text || !r.toolCalls.length) output.push({ id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: r.text, annotations: [] }] });
-      for (const tc of r.toolCalls) output.push({ id: `fc_${randomUUID().slice(0, 12)}`, type: 'function_call', status: 'completed', call_id: tc.id, name: tc.name, arguments: tc.arguments });
-      return jsonRes(res, 200, {
-        id: responseId, object: 'response', created_at: nowUnix(), status: 'completed', model,
-        output,
-        usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens, total_tokens: r.inputTokens + r.outputTokens, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
-      });
-    }
-
-    sseHeaders(res);
-    const { translate, finalize } = createResponsesTranslator(responseId, model);
-    const reader = ccRes.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let inReasoning = false;
+    const RETRY_DEADLINE = Date.now() + 120000; // 120s retry window for transient upstream errors
+    let attempt = 0;
 
     while (true) {
-      const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
-      const { done, value } = await readWithTimeout(reader, timeoutMs);
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const ln of lines) {
-        if (ln.includes('"reasoning-start"')) inReasoning = true;
-        else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/responses, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
+      attempt++;
+
+      const ccRes = await forwardToCC(ccBody, apiKey);
+      if (!ccRes.ok) {
+        const errText = await ccRes.text().catch(() => '');
+        const { message, code } = parseUpstreamError(errText, ccRes.status);
+        log('error', `CC error: ${ccRes.status} ${model} ${code || ''} ${message.slice(0, 300)}`);
+        // Permanent status errors (401/403/404/422/...) — return immediately
+        if (isPermanentHttpStatus(ccRes.status)) {
+          return jsonRes(res, ccRes.status, { error: { message, type: 'proxy_error', ...(code ? { code } : {}) } });
+        }
+        if (Date.now() >= RETRY_DEADLINE) {
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${message.slice(0, 300)}`, type: 'proxy_error', ...(code ? { code } : {}) } });
+        }
+        continue;
       }
-      const events = translate(lines);
-      for (const ev of events) sseWrite(res, ev.event, ev.data);
+
+      const reader = ccRes.body.getReader();
+      const decoder = new TextDecoder();
+
+      // Non-streaming: collect all and return JSON
+      if (responsesReq.stream === false) {
+        const r = await collectCcStream(reader);
+        if (r.text.startsWith('[ERROR:') && !r.toolCalls.length) {
+          const errMsg = r.text.replace(/^\[ERROR: /, '').replace(/]$/, '');
+          if (!isRetryableUpstreamError(errMsg)) {
+            return jsonRes(res, 400, { error: { message: errMsg, type: 'invalid_request_error' } });
+          }
+          log('warn', `Transient error on ${model} (/v1/responses non-stream), retrying: ${r.text.slice(0, 100)}`);
+          if (Date.now() >= RETRY_DEADLINE) {
+            return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${errMsg.slice(0, 300)}`, type: 'proxy_error' } });
+          }
+          continue;
+        }
+        const output = [];
+        if (r.reasoning) output.push({ id: `rs_${randomUUID().slice(0, 12)}`, type: 'reasoning', summary: [{ type: 'summary', text: r.reasoning }] });
+        if (r.text || !r.toolCalls.length) output.push({ id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: r.text, annotations: [] }] });
+        for (const tc of r.toolCalls) output.push({ id: `fc_${randomUUID().slice(0, 12)}`, type: 'function_call', status: 'completed', call_id: tc.id, name: tc.name, arguments: tc.arguments });
+        return jsonRes(res, 200, {
+          id: responseId, object: 'response', created_at: nowUnix(), status: 'completed', model,
+          output,
+          usage: { input_tokens: r.inputTokens, output_tokens: r.outputTokens, total_tokens: r.inputTokens + r.outputTokens, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } },
+        });
+      }
+
+      // Streaming: pre-buffer initial events to detect transient in-stream errors
+      const { translate, finalize } = createResponsesTranslator(responseId, model);
+      let buffer = '';
+      const preEvents = [];
+      let earlyError = null, hasContent = false, permanentError = null;
+      const MAX_PRE_BUFFER = 20;
+      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+        const { done, value } = await readWithTimeout(reader);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        preEvents.push(...translate(lines));
+        for (const ev of preEvents) {
+          const delta = ev.event === 'response.output_text.delta' ? String(ev.data?.delta || '') : null;
+          if (delta?.startsWith('[ERROR:')) {
+            const msg = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
+            if (isRetryableUpstreamError(msg)) earlyError = msg;
+            else permanentError = msg;
+          }
+          else if (ev.event === 'response.output_text.delta' || ev.event === 'response.reasoning_summary_text.delta') hasContent = true;
+        }
+        if (permanentError || earlyError || hasContent) break;
+      }
+
+      // Permanent in-stream validation error — return immediately, no retry
+      if (permanentError) {
+        log('warn', `Permanent upstream error on ${model}: ${permanentError.slice(0, 100)}`);
+        reader.cancel().catch(() => {});
+        return jsonRes(res, 400, { error: { message: permanentError, type: 'invalid_request_error' } });
+      }
+
+      if (earlyError) {
+        log('warn', `Transient error on ${model} (/v1/responses), retrying: ${earlyError.slice(0, 100)}`);
+        reader.cancel().catch(() => {});
+        if (Date.now() >= RETRY_DEADLINE) {
+          return jsonRes(res, 503, { error: { message: `Service unavailable after ${attempt} retries (120s): ${earlyError}`, type: 'proxy_error' } });
+        }
+        continue;
+      }
+
+      // Commit — send headers + pre-buffered events, then stream the rest
+      sseHeaders(res);
+      for (const ev of preEvents) sseWrite(res, ev.event, ev.data);
+      let inReasoning = false;
+
+      while (true) {
+        const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+        const { done, value } = await readWithTimeout(reader, timeoutMs);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const ln of lines) {
+          if (ln.includes('"reasoning-start"')) inReasoning = true;
+          else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+        }
+        const events = translate(lines);
+        for (const ev of events) sseWrite(res, ev.event, ev.data);
+      }
+      if (buffer.trim()) {
+        const events = translate([buffer]);
+        for (const ev of events) sseWrite(res, ev.event, ev.data);
+      }
+      for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
+      res.end();
+      return;
     }
-    if (buffer.trim()) {
-      const events = translate([buffer]);
-      for (const ev of events) sseWrite(res, ev.event, ev.data);
-    }
-    for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
-    res.end();
   } catch (e) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
@@ -1662,11 +1831,11 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.25', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
+  jsonRes(res, 200, { status: 'ok', version: '1.0.26', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.25', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.26', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -1837,7 +2006,7 @@ async function start() {
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none (pass via header)' });
-    console.log(`\n  cc-gateway v1.0.25`);
+    console.log(`\n  cc-gateway v1.0.26`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);
