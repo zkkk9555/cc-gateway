@@ -151,7 +151,7 @@ Dashboard「API Key 池」面板支持完整的图形化管理，**修改即时�
    - → `{role:"tool", content:[{type:"tool-result", toolCallId:id, toolName:从assistant反查, output:{type:"text", value:content}}]}`
 5. `tools` 定义 → `{type, name, description, input_schema}`（`function.parameters` → `input_schema`）
 6. `tool_choice` 映射：`"required"` → `"any"`，`{type:"function", function:{name:...}}` → `{type:"tool", name:...}`
-7. `max_tokens` 上限 200000
+7. `max_tokens` 原样透传（v1.034 起不再设网关侧上限；未提供时缺省 64000），超限值由上游按 per-model 限制拒绝并返回其错误消息
 8. `stream` 强制为 `true`（CC API 总是流式）
 9. 可选字段：`temperature`、`reasoning_effort`、`parallel_tool_calls`
 

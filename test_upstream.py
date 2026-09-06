@@ -54,8 +54,11 @@ class MockCC(BaseHTTPRequestHandler):
         except Exception: req = {}
         max_tokens = (req.get("params") or {}).get("max_tokens") or 0
         if max_tokens > 100000:
-            # deterministic upstream validation rejection (permanent)
-            return self._send_ndjson(['{"type":"error","error":{"message":"参数校验失败: max_tokens 超出模型上限","code":"INVALID_PARAM"}}'])
+            # deterministic upstream validation rejection (permanent);
+            # ECHOES the received value so tests can prove pass-through
+            return self._send_ndjson([json.dumps({"type": "error", "error": {
+                "message": f"参数校验失败: max_tokens={max_tokens} 超出模型上限",
+                "code": "INVALID_PARAM"}})])
         # slow first byte: headers now, body silence 65s, then a normal stream
         return self._send_ndjson([
             '{"type":"start"}',
@@ -114,8 +117,8 @@ def main():
         t0 = time.time()
         s, body = post_chat({"model": "test/model", "messages": [{"role": "user", "content": "hi"}],
                              "max_tokens": 999999, "stream": True}, timeout=15)
-        report(s == 400 and "参数校验失败" in body.decode("utf-8", "replace"),
-               "A1 chat: 参数校验失败 → 立即 400（不再重试风暴）", f"status={s} {round(time.time()-t0,1)}s")
+        ok = s == 400 and "参数校验失败" in body.decode("utf-8", "replace") and "999999" in body.decode("utf-8", "replace")
+        report(ok, "A1 chat: 参数校验失败 → 立即 400 且 999999 原样透传", f"status={s} {round(time.time()-t0,1)}s")
 
         # A2: messages — same classification in its own pre-buffer loop
         t0 = time.time()
@@ -127,8 +130,8 @@ def main():
             r = urllib.request.urlopen(req, timeout=15); s, body = r.status, r.read()
         except urllib.error.HTTPError as e: s, body = e.code, e.read()
         except Exception as e: s, body = 0, str(e).encode()
-        report(s == 400 and "参数校验失败" in body.decode("utf-8", "replace"),
-               "A2 messages: 参数校验失败 → 立即 400", f"status={s} {round(time.time()-t0,1)}s")
+        ok = s == 400 and "参数校验失败" in body.decode("utf-8", "replace") and "999999" in body.decode("utf-8", "replace")
+        report(ok, "A2 messages: 参数校验失败 → 立即 400 且 999999 原样透传", f"status={s} {round(time.time()-t0,1)}s")
 
         # A3: responses — same classification in its own pre-buffer loop
         t0 = time.time()
@@ -140,8 +143,8 @@ def main():
             r = urllib.request.urlopen(req, timeout=15); s, body = r.status, r.read()
         except urllib.error.HTTPError as e: s, body = e.code, e.read()
         except Exception as e: s, body = 0, str(e).encode()
-        report(s == 400 and "参数校验失败" in body.decode("utf-8", "replace"),
-               "A3 responses: 参数校验失败 → 立即 400", f"status={s} {round(time.time()-t0,1)}s")
+        ok = s == 400 and "参数校验失败" in body.decode("utf-8", "replace") and "999999" in body.decode("utf-8", "replace")
+        report(ok, "A3 responses: 参数校验失败 → 立即 400 且 999999 原样透传", f"status={s} {round(time.time()-t0,1)}s")
 
         # B1: slow first byte (65s silence after headers) → must succeed, not 502@60s
         t0 = time.time()

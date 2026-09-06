@@ -146,17 +146,17 @@ print("\n═══ E: Error recovery (bad→good→bad→good) ═══")
 t0 = time.time()
 seq = [
     ({"model": "bad-model"}, True),      # should error
-    ({"model": MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 5, "stream": True}, False),  # should work
+    ({"model": MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 300, "stream": True}, False),  # should work
     ({"model": "bad-model"}, True),      # should error
-    ({"model": MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 5, "stream": True}, False),  # should work
+    ({"model": MODEL, "messages": [{"role": "user", "content": "ok"}], "max_tokens": 300, "stream": True}, False),  # should work
 ]
 recovery_ok = 0
 for body, expect_error in seq:
     try:
         resp = post("/v1/chat/completions", body, timeout=30)
         if not expect_error:
-            text, ev = read_sse(resp, max_events=10)
-            if text: recovery_ok += 1
+            text, ev = read_sse(resp, max_events=30)
+            if text or ev >= 3: recovery_ok += 1   # reasoning models may spend small budgets on thinking — a real streamed response counts
     except HTTPError:
         if expect_error: recovery_ok += 1
     except: pass

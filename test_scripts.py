@@ -68,7 +68,20 @@ def bat_log_tail(name, n=400):
     except OSError:
         return "(no log)"
 
+def alive(pid):
+    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"], capture_output=True).stdout.decode("utf-8", "replace")
+    return str(pid) in out
+
 def main():
+    global decoy_pid
+    # decoy: another project's daemon-lookalike (cmd.exe with '--bg' in its
+    # command line, no 'cc-gateway' anywhere) — must NEVER be killed
+    decoy = subprocess.Popen(["cmd", "/c", "title decoy --bg && ping -n 600 127.0.0.1 >nul"],
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    decoy_pid = decoy.pid
+    time.sleep(1)
+    decoy_up = alive(decoy_pid)
+
     # E0: encoding red-line — UTF-8 strict, no BOM, declares chcp 65001
     for name in ("启动网关.bat", "停止网关.bat", "重启网关.bat"):
         path = os.path.join(ROOT, name)
@@ -99,6 +112,8 @@ def main():
     pid2 = pid_on_3050()
     report(up2 and pid2 and pid2 != pid1, "S2 重启网关 → 回到 200 且 PID 已更换",
            f"rc={rc} {pid1} → {pid2}" + ("" if "\ufffd" not in out else " | 输出含乱码符"))
+    report(decoy_up and alive(decoy_pid), "S2b 诱饵进程存活(重启不误杀其他项目的 --bg 守护)",
+           f"decoy={decoy_pid}")
 
     # S3: 停止网关.bat → port released
     rc, out = run_bat("停止网关.bat")
@@ -109,11 +124,17 @@ def main():
     report(freed and pid_on_3050() is None, "S3 停止网关 → 3050 释放",
            f"rc={rc} obs={obs3} netstat3050={lines3050} log[{bat_log_tail('停止网关.bat')}]"
            + ("" if "\ufffd" not in out else " | 输出含乱码符"))
+    report(decoy_up and alive(decoy_pid), "S3b 诱饵进程存活(停止不误杀其他项目的 --bg 守护)",
+           f"decoy={decoy_pid}")
 
     return finish()
 
 def finish():
-    # safety net: never leave the gateway running behind the test
+    # cleanup decoy + safety net: never leave the gateway running behind the test
+    try:
+        subprocess.run(["taskkill", "/PID", str(decoy_pid), "/T", "/F"], capture_output=True)
+    except Exception:
+        pass
     p = pid_on_3050()
     if p:
         subprocess.run(["taskkill", "/PID", str(p), "/F"], capture_output=True)

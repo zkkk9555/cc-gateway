@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const VERSION = '1.0.33';
+const VERSION = '1.0.34';
 
 // ── CLI Args ────────────────────────────────────────────────────────────────
 
@@ -126,6 +126,9 @@ function getLogFile() {
     if (logStream) { try { logStream.end(); } catch {} }
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
     logStream = fs.createWriteStream(path.join(LOG_DIR, `gateway-${today}.log`), { flags: 'a' });
+    // Async write failures (disk full, file locked) would otherwise hit the
+    // uncaughtException handler → log() → write again → infinite error loop.
+    logStream.on('error', () => { logStream = null; logFileDate = ''; });
     logFileDate = today;
     cleanOldLogs();
   }
@@ -314,6 +317,7 @@ function getSessionId(apiKey) {
   if (existing && Date.now() < existing.expiresAt) return existing.sessionId;
   const sessionId = crypto.randomUUID();
   const jitter = Math.floor(Math.random() * SESSION_JITTER);
+  if (sessions.size >= 500) sessions.delete(sessions.keys().next().value); // FIFO cap
   sessions.set(apiKey, { sessionId, expiresAt: Date.now() + SESSION_DURATION + jitter });
   log('info', `Session created for ${apiKey.slice(0, 8)}`);
   return sessionId;
@@ -374,6 +378,9 @@ function poolMarkSuccess(key) {
 }
 
 function poolCooldown(key, reason = 'rate_limited') {
+  // Passthrough keys (not in the pool) would grow keyHealth forever — only
+  // pool members get health tracking.
+  if (!keyPool.keys.includes(key)) return;
   const h = keyHealth(key);
   h.cooldownUntil = Date.now() + KEY_COOLDOWN_MS;
   h.failures++; h.lastError = reason;
@@ -459,7 +466,11 @@ const keyStates = new Map(); // apiKey → { fingerprint, nextInitAt }
 
 function getKeyState(apiKey) {
   let st = keyStates.get(apiKey);
-  if (!st) { st = { fingerprint: generateFingerprint(), nextInitAt: 0 }; keyStates.set(apiKey, st); }
+  if (!st) {
+    if (keyStates.size >= 500) keyStates.delete(keyStates.keys().next().value); // FIFO cap
+    st = { fingerprint: generateFingerprint(), nextInitAt: 0 };
+    keyStates.set(apiKey, st);
+  }
   return st;
 }
 
@@ -554,7 +565,7 @@ function socks5Connect(proxyHost, proxyPort, targetHost, targetPort) {
     let step = 0;
     socket.on('data', (data) => {
       if (step === 0) {
-        if (data[0] !== 0x05 || data[1] !== 0x00) { reject(new Error('SOCKS5 auth failed')); return; }
+        if (data[0] !== 0x05 || data[1] !== 0x00) { socket.destroy(); reject(new Error('SOCKS5 auth failed')); return; }
         step = 1;
         const hostBuf = Buffer.from(targetHost);
         const buf = Buffer.alloc(7 + hostBuf.length);
@@ -564,7 +575,10 @@ function socks5Connect(proxyHost, proxyPort, targetHost, targetPort) {
         buf.writeUInt16BE(targetPort, 5 + hostBuf.length);
         socket.write(buf);
       } else if (step === 1) {
-        if (data[1] !== 0x00) { reject(new Error('SOCKS5 connect failed: code=' + data[1])); return; }
+        if (data[1] !== 0x00) { socket.destroy(); reject(new Error('SOCKS5 connect failed: code=' + data[1])); return; }
+        // Tunnel established — disarm the 10s handshake timeout: it must not
+        // destroy live streams when the model stays silent >10s (reasoning).
+        socket.setTimeout(0);
         resolve(socket);
       }
     });
@@ -820,7 +834,9 @@ function baseHeaders(apiKey) {
 function buildCcRequest(openaiReq) {
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
   const messages = openaiReq.messages || [];
-  const maxTokens = Math.min(openaiReq.max_tokens || 64000, 200000);
+  // max_tokens passes through untouched — the upstream enforces its own
+  // per-model limits and rejects oversized values with a clear 400.
+  const maxTokens = openaiReq.max_tokens || 64000;
 
   // Extract system/developer messages
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
@@ -1114,10 +1130,11 @@ async function forwardToCC(body, apiKey, signal) {
 
 // Read with timeout — if CC API stalls, we don't hang forever
 function readWithTimeout(reader, timeoutMs = 60000) {
+  let timer;
   return Promise.race([
     reader.read(),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('Stream read timeout')), timeoutMs)),
-  ]);
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Stream read timeout')), timeoutMs); }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 // Read a full CC NDJSON stream and collect text / reasoning / tool calls / usage.
@@ -1620,6 +1637,7 @@ async function handleChatCompletions(req, res) {
     let attempt = 0;
 
     while (true) {
+      if (res.destroyed) { log('warn', `Client gone — stop retrying ${model}`); return; }
       if (attempt > 0) {
         log('info', `Retry ${attempt} for ${model} (${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
         completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
@@ -1855,6 +1873,7 @@ async function handleMessages(req, res) {
     let attempt = 0;
 
     while (true) {
+      if (res.destroyed) { log('warn', `Client gone — stop retrying ${model} (/v1/messages)`); return; }
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/messages, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
@@ -1979,23 +1998,31 @@ async function handleMessages(req, res) {
       for (const ev of preEvents) sseWrite(res, ev.event, ev.data);
       let inReasoning = false;
 
-      while (true) {
-        const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
-        const { done, value } = await readWithTimeout(reader, timeoutMs);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const ln of lines) {
-          if (ln.includes('"reasoning-start"')) inReasoning = true;
-          else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      try {
+        while (true) {
+          const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+          const { done, value } = await readWithTimeout(reader, timeoutMs);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const ln of lines) {
+            if (ln.includes('"reasoning-start"')) inReasoning = true;
+            else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+          }
+          const events = translate(lines);
+          for (const ev of events) sseWrite(res, ev.event, ev.data);
         }
-        const events = translate(lines);
-        for (const ev of events) sseWrite(res, ev.event, ev.data);
-      }
-      if (buffer.trim()) {
-        const events = translate([buffer]);
-        for (const ev of events) sseWrite(res, ev.event, ev.data);
+        if (buffer.trim()) {
+          const events = translate([buffer]);
+          for (const ev of events) sseWrite(res, ev.event, ev.data);
+        }
+      } catch (e) {
+        // Post-commit stream failure (stall/reset): cancel the upstream reader
+        // and close the SSE sequence cleanly via finalize() — the outer catch
+        // would emit a malformed block sequence Claude Code can't parse.
+        log('warn', `Upstream stream error after commit (/v1/messages): ${e.message}`);
+        reader.cancel().catch(() => {});
       }
       for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
       res.end();
@@ -2005,14 +2032,8 @@ async function handleMessages(req, res) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { type: 'error', error: { type: 'api_error', message: e.message } });
     else {
-      // On timeout after headers sent, send error event and close
-      try {
-        sseWrite(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
-        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: `[ERROR: Upstream timeout — ${e.message}]` } });
-        sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
-        sseWrite(res, 'message_stop', { type: 'message_stop' });
-      } catch {}
-      res.end();
+      // Headers already sent and translator state is unknown — just close.
+      try { res.end(); } catch {}
     }
   }
 }
@@ -2038,6 +2059,7 @@ async function handleResponses(req, res) {
     let attempt = 0;
 
     while (true) {
+      if (res.destroyed) { log('warn', `Client gone — stop retrying ${model} (/v1/responses)`); return; }
       if (attempt > 0) log('info', `Retry ${attempt} for ${model} (/v1/responses, ${Math.round((RETRY_DEADLINE - Date.now()) / 1000)}s left)`);
       attempt++;
 
@@ -2163,23 +2185,30 @@ async function handleResponses(req, res) {
       for (const ev of preEvents) sseWrite(res, ev.event, ev.data);
       let inReasoning = false;
 
-      while (true) {
-        const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
-        const { done, value } = await readWithTimeout(reader, timeoutMs);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const ln of lines) {
-          if (ln.includes('"reasoning-start"')) inReasoning = true;
-          else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+      try {
+        while (true) {
+          const timeoutMs = inReasoning ? (CFG.reasoning_timeout_ms || 300000) : (CFG.stream_timeout_ms || 120000);
+          const { done, value } = await readWithTimeout(reader, timeoutMs);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (const ln of lines) {
+            if (ln.includes('"reasoning-start"')) inReasoning = true;
+            else if (ln.includes('"finish-step"') || ln.includes('"reasoning-end"')) inReasoning = false;
+          }
+          const events = translate(lines);
+          for (const ev of events) sseWrite(res, ev.event, ev.data);
         }
-        const events = translate(lines);
-        for (const ev of events) sseWrite(res, ev.event, ev.data);
-      }
-      if (buffer.trim()) {
-        const events = translate([buffer]);
-        for (const ev of events) sseWrite(res, ev.event, ev.data);
+        if (buffer.trim()) {
+          const events = translate([buffer]);
+          for (const ev of events) sseWrite(res, ev.event, ev.data);
+        }
+      } catch (e) {
+        // Post-commit stream failure: cancel the reader, let finalize() close
+        // the sequence cleanly (response.completed) instead of the outer catch.
+        log('warn', `Upstream stream error after commit (/v1/responses): ${e.message}`);
+        reader.cancel().catch(() => {});
       }
       for (const ev of finalize()) sseWrite(res, ev.event, ev.data);
       res.end();
@@ -2189,12 +2218,8 @@ async function handleResponses(req, res) {
     logError(`Request error: ${e.message}`, e);
     if (!res.headersSent) jsonRes(res, 502, { error: { message: e.message, type: 'proxy_error' } });
     else {
-      try {
-        sseWrite(res, 'response.output_text.delta', { type: 'response.output_text.delta', item_id: 'msg_error', output_index: 0, content_index: 0, delta: `[ERROR: Upstream timeout — ${e.message}]` });
-        sseWrite(res, 'response.output_item.done', { type: 'response.output_item.done', output_index: 0, item: { id: 'msg_error', type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: `[ERROR: Upstream timeout — ${e.message}]`, annotations: [] }] } });
-        sseWrite(res, 'response.completed', { type: 'response.completed', response: { id: responseId, object: 'response', status: 'completed', output: [] } });
-      } catch {}
-      res.end();
+      // Headers already sent and translator state is unknown — just close.
+      try { res.end(); } catch {}
     }
   }
 }
@@ -2359,21 +2384,24 @@ async function handleApiKeyTest(req, res) {
     const decoder = new TextDecoder();
     const deadline = Date.now() + 20000;
     let finished = false, buffer = '';
-    while (!finished && Date.now() < deadline) {
-      const { done, value } = await Promise.race([
-        reader.read(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), Math.max(deadline - Date.now(), 1))),
-      ]);
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try { if (JSON.parse(line).type === 'finish') finished = true; } catch {}
+    try {
+      while (!finished && Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), Math.max(deadline - Date.now(), 1))),
+        ]);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { if (JSON.parse(line).type === 'finish') finished = true; } catch {}
+        }
       }
+    } finally {
+      reader.cancel().catch(() => {});
     }
-    reader.cancel().catch(() => {});
     jsonRes(res, 200, { ok: true, ms: Date.now() - start, status: 200 });
   } catch (e) {
     jsonRes(res, 200, { ok: false, ms: Date.now() - start, status: 0, error: e.message });
@@ -2405,30 +2433,33 @@ async function handleApiTest(req, res) {
     let resultText = '';
     let finished = false;
     const deadline = Date.now() + TIMEOUT_MS;
-    while (!finished && Date.now() < deadline) {
-      const { done, value } = await Promise.race([
-        reader.read(),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), deadline - Date.now()))
-      ]);
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const ev = JSON.parse(line);
-          if (ev.type === 'text-delta') resultText += ev.text || '';
-          if (ev.type === 'error') resultText += `[ERROR: ${ev.error?.message || 'unknown'}]`;
-          if (ev.type === 'finish-step') {
-            const u = ev.usage || {};
-            recordTokens(model, u.inputTokens || 0, u.outputTokens || 0);
-          }
-          if (ev.type === 'finish') finished = true;
-        } catch {}
+    try {
+      while (!finished && Date.now() < deadline) {
+        const { done, value } = await Promise.race([
+          reader.read(),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), deadline - Date.now()))
+        ]);
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const ev = JSON.parse(line);
+            if (ev.type === 'text-delta') resultText += ev.text || '';
+            if (ev.type === 'error') resultText += `[ERROR: ${ev.error?.message || 'unknown'}]`;
+            if (ev.type === 'finish-step') {
+              const u = ev.usage || {};
+              recordTokens(model, u.inputTokens || 0, u.outputTokens || 0);
+            }
+            if (ev.type === 'finish') finished = true;
+          } catch {}
+        }
       }
+    } finally {
+      reader.cancel().catch(() => {});
     }
-    reader.cancel().catch(() => {});
     jsonRes(res, 200, { ok: true, model, status: 200, ms: Date.now() - start, response: resultText.slice(0, 200) });
   } catch (e) {
     jsonRes(res, 200, { ok: false, model, status: 0, ms: Date.now() - start, error: e.message });
