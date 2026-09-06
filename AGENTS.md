@@ -2,6 +2,8 @@
 
 单文件 Node.js 网关(零 npm 依赖,Node 22+)。完整规格见 `SPEC.md`,工程流程走 mattpocock-skills。
 
+> 若 `.scratch/WORKFLOW-ACTIVE.md` 存在 → 先调 mattpocock-skills 再继续。
+
 ## Agent skills
 
 ### Issue tracker

@@ -39,3 +39,13 @@ Skills called: mattpocock-skills (bootstrap) → ask-matt (T0; doc-only reply, l
 - Review: Standards 硬违规 ×1 (config.json.example 仍缺 log_retention_days/admin_token —— 修), Spec 部分实现 ×1 (cleanOldLogs 单文件删除失败应 warn 非静默 —— 修); smell 只记录不修: 仪表盘 401 处理 3 处形状 (keyAction/testKey 未并走 api())、requireAdmin 位置在 Key 池分区下、启动时 cleanOldLogs 幂等触发两次。修复后两 seam 测试复跑全绿。
 - AGENTS.md + docs/agents/* 为 setup 步骤规定产物 (首个真实工程轮触发), 非 spec scope creep; SPEC.md 文件树顺带补齐 test_pool/test_heavy 既有条目 (文档对齐现实)。
 - Verify: test_logs.py 3/3, test_admin.py 8/8, test_pool.py 9/9, `/health` v1.0.31 冒烟; 红证据: test_logs.py L1 EXIT=1 → 绿 EXIT=0; test_admin.py 4 failed EXIT=1 → 8/8 EXIT=0。全量 test_*.py 未跑 (不触协议翻译,避免真实上游配额消耗,理由见 spec Testing Decisions)。
+
+## 2026-09-06 付费模型冒烟 + 断连提案否决记录 (无版本号,纯测试轮)
+
+Skills called: mattpocock-skills (v48 重读,用户升级后明示重读;引用/治理文件全部重读) → ask-matt (T0) → to-spec (轻量)。
+
+- 用户否决「完整断连中止」提案(原话:"上游跑就跑吧…我几乎从来没有在任务跑着的时候关闭 Agent")→ 记为 wontfix,不再实施;已写入长期记忆防重提。
+- 新增 test_paid_smoke.py:付费/普通套餐模型轻量冒烟(每模型 1 个流式请求,max_tokens=64,断言 200+事件流+finish+usage;推理模型断言事件流不断言正文)。手动按需运行,不进常规套件。
+- 实测:meta/muse-spark-1.3-contributor ✅(3 事件,finish=length,推理预算内)、deepseek/deepseek-v4-flash ✅(66 事件,直连路由)、gpt-5.6-luna ✅(30 事件,finish=stop,代理路由)——直连/代理/推理/标准四条路径全覆盖,3/3。
+- v48 合规:WORKFLOW-ACTIVE 标记建立(工程轮次:5)并于收尾删除;AGENTS.md 补写常驻召回入口(setup 判据回补);本会话第 1 次 [反思] 已追加中央日志(第 3-4 轮早于规则存在,宁多勿少原则下本轮补触发)。
+- Verify:PAID SMOKE 3/3 EXIT=0;网关停回原状。
