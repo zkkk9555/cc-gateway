@@ -23,7 +23,11 @@ C:\Project\cc-gateway\
 ├── test_aggressive.py   ← 激进压测
 ├── test_logs.py         ← 日志保留清理回归（隔离实例，端口 3052）
 ├── test_admin.py        ← 管理令牌回归（隔离实例，端口 3053/3054）
-├── 启动网关.bat / 停止网关.bat / restart.bat / start.bat / stop.bat
+├── test_upstream.py     ← 上游边缘回归（mock 上游，端口 3057/3058）
+├── test_scripts.py      ← 启动/停止/重启脚本全链路回归
+├── 启动网关.bat          ← 守护启动：隐藏窗口 + 崩溃自启 + 防多开 + 打开面板
+├── 停止网关.bat          ← 整树击杀守护循环 + 3050 进程（5 轮重试直至端口释放）
+├── 重启网关.bat          ← 停止 → 等端口释放 → 重新守护启动
 ├── .gitignore
 └── SPEC.md              ← 本文件
 ```

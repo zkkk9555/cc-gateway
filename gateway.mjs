@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const VERSION = '1.0.32';
+const VERSION = '1.0.33';
 
 // ── CLI Args ────────────────────────────────────────────────────────────────
 
