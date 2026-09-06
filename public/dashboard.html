@@ -60,6 +60,13 @@ button.ghost{background:#fff;border:1px solid var(--border);color:var(--text)}
 <h1>cc-gateway</h1>
 <div class="sub">Command Code CLI → 标准 API 网关 · OpenAI / Anthropic / Responses · SOCKS5 代理 · 自动重试 · Free 模型自动测试</div>
 
+<!-- 管理令牌（admin_token 设置后显示） -->
+<div id="auth-bar" class="row" style="display:none;margin:-8px 0 16px;padding:10px 14px;background:#fff7ed;border:1px solid #fdba74;border-radius:10px">
+  <span style="font-size:13px;font-weight:600;white-space:nowrap">管理令牌</span>
+  <input id="auth-input" class="grow" type="password" placeholder="config.json 中 admin_token 的值（未设置则无需填写）" style="padding:6px 10px;border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:13px;background:#fff">
+  <button onclick="saveToken()">保存</button>
+</div>
+
 <!-- 接入地址 -->
 <div class="panel" style="margin-bottom:14px">
   <div style="font-size:13px;font-weight:700;margin-bottom:8px">接入地址 <span style="font-weight:400;color:var(--dim)">（点复制按钮一键复制）</span></div>
@@ -107,7 +114,26 @@ button.ghost{background:#fff;border:1px solid var(--border);color:var(--text)}
 
 <script>
 const $=(id)=>document.getElementById(id);
-const api=async(path,opt)=>{const r=await fetch(path,opt);return r.json()};
+const adminToken=()=>localStorage.getItem("cc_admin_token")||"";
+const authHeaders=(extra)=>{const h={...(extra||{})};if(adminToken())h["x-admin-token"]=adminToken();return h};
+function showAuthBar(){
+  const bar=$("auth-bar");
+  const already=bar.style.display!=="none";
+  if(!$("auth-input").value)$("auth-input").value=adminToken();
+  bar.style.display="flex";
+  if(!already){$("auth-input").focus();toast("需要管理令牌（config.json 的 admin_token）","bad")}
+}
+async function saveToken(){
+  localStorage.setItem("cc_admin_token",$("auth-input").value.trim());
+  $("auth-bar").style.display="none";
+  toast("管理令牌已保存","ok");
+  refresh();
+}
+const api=async(path,opt={})=>{
+  const r=await fetch(path,{...opt,headers:authHeaders(opt.headers)});
+  if(r.status===401)showAuthBar();
+  try{return await r.json()}catch{return {}}
+};
 
 function toast(msg,type="ok"){
   const t=document.createElement("div");
@@ -254,6 +280,7 @@ async function refreshLogs(){
 // ---- Status & Endpoints ----
 async function refreshStatus(){
   const s=await api("/api/status");
+  if(s.auth_required&&!adminToken())showAuthBar();
   $("overview").innerHTML=`
     <div class="card"><div class="k">上游</div><div class="v sm">${s.api}</div></div>
     <div class="card"><div class="k">运行时长</div><div class="v sm">${uptimeStr(s.uptime)}</div></div>
@@ -270,7 +297,8 @@ async function refreshStatus(){
 // ---- Key pool management ----
 async function keyAction(path,key){
   try{
-    const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key})});
+    const r=await fetch(path,{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({key})});
+    if(r.status===401){showAuthBar();return false}
     const d=await r.json();
     if(d.error){toast(d.error,"bad");return false}
     return d;
@@ -291,10 +319,12 @@ async function enableKey(k){
 async function testKey(k){
   toast("正在测试 "+k.slice(0,9)+"…","warn");
   try{
-    const r=await fetch("/api/keys/test",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});
+    const r=await fetch("/api/keys/test",{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify({key:k})});
+    if(r.status===401){showAuthBar();return}
     const d=await r.json();
     toast(d.ok?`✓ Key 可用 (${d.ms}ms)`:"✗ 测试失败: "+(d.error||"未知"),d.ok?"ok":"bad");
-  }catch(e){toast("测试请求失败: "+e,"bad")}
+  }catch(e){toast("测试请求失败: "+e,"bad")
+  }
 }
 async function loadKeys(){
   const d=await api("/api/keys");

@@ -20,11 +20,13 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+const VERSION = '1.0.31';
+
 // ── CLI Args ────────────────────────────────────────────────────────────────
 
 const args = process.argv.slice(2);
 if (args.includes('--help') || args.includes('-h')) {
-  console.log(`cc-gateway v1.0.30
+  console.log(`cc-gateway v${VERSION}
 Usage:
   node gateway.mjs                    Start the gateway
   node gateway.mjs --set-key          Set primary API key interactively
@@ -37,12 +39,12 @@ Usage:
   node gateway.mjs --help             Show this help`);
   process.exit(0);
 }
-if (args.includes('--version')) { console.log('cc-gateway v1.0.30'); process.exit(0); }
+if (args.includes('--version')) { console.log(`cc-gateway v${VERSION}`); process.exit(0); }
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(__dirname, 'config.json');
-const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_keys: [], api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 }, stream_timeout_ms: 120000, reasoning_timeout_ms: 300000 };
+const DEFAULT_CONFIG = { port: 3050, host: '0.0.0.0', api_key: '', api_keys: [], api_base: 'https://api.commandcode.ai', log_level: 'info', proxy: { enabled: false, host: '127.0.0.1', port: 7897 }, stream_timeout_ms: 120000, reasoning_timeout_ms: 300000, log_retention_days: 30, admin_token: '' };
 
 function loadConfig() {
   let cfg = { ...DEFAULT_CONFIG };
@@ -125,8 +127,28 @@ function getLogFile() {
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
     logStream = fs.createWriteStream(path.join(LOG_DIR, `gateway-${today}.log`), { flags: 'a' });
     logFileDate = today;
+    cleanOldLogs();
   }
   return logStream;
+}
+
+// Retention: delete gateway-YYYY-MM-DD.log files older than log_retention_days
+// (0 disables). Date comes from the filename — ISO strings compare correctly.
+function cleanOldLogs() {
+  const days = CFG.log_retention_days;
+  if (!days || days <= 0) return;
+  const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+  let removed = 0;
+  try {
+    if (!fs.existsSync(LOG_DIR)) return;
+    for (const f of fs.readdirSync(LOG_DIR)) {
+      const m = /^gateway-(\d{4}-\d{2}-\d{2})\.log$/.exec(f);
+      if (!m || m[1] >= cutoff) continue;
+      try { fs.unlinkSync(path.join(LOG_DIR, f)); removed++; }
+      catch (e) { log('warn', `Log retention: failed to remove ${f}: ${e.message}`); }
+    }
+    if (removed) log('info', `Log retention: removed ${removed} file(s) older than ${cutoff}`);
+  } catch (e) { log('warn', `Log retention failed: ${e.message}`); }
 }
 
 // Request correlation: every log line emitted while handling a request is
@@ -2203,11 +2225,7 @@ function handleModels(req, res) {
 }
 
 function handleHealth(req, res) {
-  jsonRes(res, 200, { status: 'ok', version: '1.0.30', cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
-}
-
-function handleRoot(req, res) {
-  jsonRes(res, 200, { name: 'cc-gateway', version: '1.0.30', description: 'Command Code API Gateway', endpoints: ['/v1/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/health'] });
+  jsonRes(res, 200, { status: 'ok', version: VERSION, cc_version: CC_VERSION, uptime: Math.floor((Date.now() - startTime) / 1000) });
 }
 
 // ── HTTP Server ─────────────────────────────────────────────────────────────
@@ -2241,6 +2259,7 @@ function handleApiStatus(req, res) {
     proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port}` : 'off',
     key: CFG.api_key ? `${CFG.api_key.slice(0, 8)}…` : 'none',
     key_pool: poolStatus(),
+    auth_required: !!CFG.admin_token,
   });
 }
 
@@ -2260,6 +2279,16 @@ function handleApiModels(req, res) {
 
 // ── Key pool management API (dashboard) ─────────────────────────────────────
 // Plaintext keys by explicit user decision — instance is operator-owned.
+// /api/* is token-gated when admin_token is set in config.json (opt-in;
+// unset = open, preserving the operator-local design).
+
+function requireAdmin(req) {
+  const expected = String(CFG.admin_token || '');
+  if (!expected) return true;
+  const provided = Buffer.from(String(req.headers['x-admin-token'] || ''));
+  const want = Buffer.from(expected);
+  return provided.length === want.length && crypto.timingSafeEqual(provided, want);
+}
 
 function handleApiKeys(req, res) {
   jsonRes(res, 200, poolStatus(true));
@@ -2421,6 +2450,11 @@ async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   try {
+    // Dashboard admin API — token-gated when admin_token is set
+    if (url.pathname.startsWith('/api/') && !requireAdmin(req)) {
+      return jsonRes(res, 401, { error: 'Unauthorized: missing or invalid x-admin-token header' });
+    }
+
     // Dashboard routes
     if (url.pathname === '/' && req.method === 'GET') return handleDashboard(req, res);
     if (url.pathname === '/api/status' && req.method === 'GET') return handleApiStatus(req, res);
@@ -2474,13 +2508,16 @@ async function start() {
   // Load persisted token usage
   loadUsage();
 
+  // Apply log retention policy
+  cleanOldLogs();
+
   // Refresh CC version + model list
   await refreshCcVersion();
   await refreshModels();
 
   server.listen(CFG.port, CFG.host, () => {
     log('info', `cc-gateway started`, { port: CFG.port, host: CFG.host, api: CFG.api_base, cc_version: CC_VERSION, proxy: CFG.proxy?.enabled ? `socks5://${CFG.proxy.host}:${CFG.proxy.port} (foreign only)` : 'off', key_pool: `${poolActiveCount()}/${keyPool.keys.length} healthy` });
-    console.log(`\n  cc-gateway v1.0.30`);
+    console.log(`\n  cc-gateway v${VERSION}`);
     console.log(`  Listening on http://${CFG.host}:${CFG.port}`);
     console.log(`  CC API: ${CFG.api_base}`);
     console.log(`  CC Version: ${CC_VERSION}`);

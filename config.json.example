@@ -2,11 +2,16 @@
   "port": 3050,
   "host": "0.0.0.0",
   "api_key": "",
+  "api_keys": [],
   "api_base": "https://api.commandcode.ai",
   "log_level": "info",
   "proxy": {
     "enabled": false,
     "host": "127.0.0.1",
     "port": 7897
-  }
+  },
+  "stream_timeout_ms": 120000,
+  "reasoning_timeout_ms": 300000,
+  "log_retention_days": 30,
+  "admin_token": ""
 }

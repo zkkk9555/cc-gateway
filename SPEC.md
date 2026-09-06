@@ -17,8 +17,12 @@ C:\Project\cc-gateway\
 ├── logs/                ← 按天滚动日志（不入库）
 ├── test_matrix.py       ← 3模型×3API模式 流式回归测试
 ├── test_extra.py        ← 非流式/工具调用/错误清洗 回归测试
+├── test_pool.py         ← Key 池回归（隔离实例，端口 3051）
+├── test_heavy.py        ← 重负载回归（长文本/UTF-8/并发）
 ├── test_stress.py       ← 压力测试
 ├── test_aggressive.py   ← 激进压测
+├── test_logs.py         ← 日志保留清理回归（隔离实例，端口 3052）
+├── test_admin.py        ← 管理令牌回归（隔离实例，端口 3053/3054）
 ├── 启动网关.bat / 停止网关.bat / restart.bat / start.bat / stop.bat
 ├── .gitignore
 └── SPEC.md              ← 本文件
@@ -37,15 +41,21 @@ C:\Project\cc-gateway\
   "port": 3050,
   "host": "0.0.0.0",
   "api_key": "user_xxx",
+  "api_keys": [],
   "api_base": "https://api.commandcode.ai",
   "log_level": "info",
   "proxy": { "enabled": false, "host": "127.0.0.1", "port": 7897 },
-  "stream_timeout_ms": 120000
+  "stream_timeout_ms": 120000,
+  "reasoning_timeout_ms": 300000,
+  "log_retention_days": 30,
+  "admin_token": ""
 }
 ```
 
 - `stream_timeout_ms`：流式传输中单次 `reader.read()` 的最大等待时间（毫秒），默认 120000（2 分钟）。推理型模型（如 `meta/muse-spark`）思考时可能长时间不发事件，需适当增大此值。
 - `reasoning_timeout_ms`：推理阶段（检测到 `reasoning-start` 后）的超时时间，默认 300000（5 分钟）。推理模型内部思考时不会发送中间事件，此值需大于模型最长推理时间。
+- `log_retention_days`：日志保留天数，默认 30（与 usage.json 的 30 天清理一致）。启动与日切时按文件名日期自动删除过期的 `gateway-*.log`；`0` = 关闭清理。
+- `admin_token`：可选管理令牌。设置后所有 `/api/*` 需要 `x-admin-token` 请求头（401 otherwise），仪表盘自动弹出令牌输入条（存浏览器 localStorage）；不设置则保持原无鉴权行为。`/`、`/health`、`/v1/*` 永不要求令牌。
 
 - 首次启动时自动创建默认 config.json
 - 支持环境变量覆写：`PORT`、`HOST`、`CC_API_KEY`、`CC_API_BASE`、`LOG_LEVEL`
@@ -102,7 +112,7 @@ Dashboard「API Key 池」面板支持完整的图形化管理，**修改即时�
 | `/api/keys/enable` | POST | `{key}` 清除摘除/冷却/失败状态 |
 | `/api/keys/test` | POST | `{key}` 单 key 连通性测试（deepseek ping，20s 超时） |
 
-安全说明：管理 API 与 key 明文无鉴权（按运营者自用设计）。网关默认绑定 0.0.0.0，若部署在不可信局域网请改 `host: 127.0.0.1` 或加防火墙规则。
+安全说明：config.json 设置 `admin_token`（任意自定义字符串）后，所有 `/api/*` 需携带 `x-admin-token` 请求头，仪表盘会在需要时自动弹出「管理令牌」输入条（保存在浏览器 localStorage）；不设置则保持运营者自用无鉴权（明示设计）。`/health`、`/v1/*` 网关面永不要求令牌。网关默认绑定 0.0.0.0，部署在不可信局域网时建议设置 admin_token、改 `host: 127.0.0.1` 或加防火墙规则。
 
 ## API 端点
 
@@ -407,7 +417,7 @@ CC 上游可能以两种事件序列发出工具调用，翻译器两者都支�
 - `Permanent upstream error` / `Transient error ... retrying` / `Connection error ... retrying` — 错误分类与重试过程
 - `CC error: <状态码> <模型> <错误码> <消息>` — 上游 HTTP 错误（含原始错误消息前 300 字符）
 
-文件：`logs/gateway-YYYY-MM-DD.log` 按天滚动，同步输出 stderr 与 dashboard 实时日志（内存缓冲 200 条）。日志同时驱动修复：出现 `Unknown CC event type` 或 `parseUpstreamError` 未识别的错误体时，日志中保留了原始数据前 150/300 字符，可直接用于适配。
+文件：`logs/gateway-YYYY-MM-DD.log` 按天滚动，同步输出 stderr 与 dashboard 实时日志（内存缓冲 200 条）。日志保留由 `log_retention_days` 控制（默认 30 天，0=关闭），启动与日切时自动清理过期文件。日志同时驱动修复：出现 `Unknown CC event type` 或 `parseUpstreamError` 未识别的错误体时，日志中保留了原始数据前 150/300 字符，可直接用于适配。
 
 支持 `LOG_LEVEL` 环境变量：debug / info / warn / error
 
