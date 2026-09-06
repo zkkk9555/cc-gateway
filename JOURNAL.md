@@ -1,5 +1,15 @@
 # JOURNAL — cc-gateway 工程轮流水
 
+## 2026-09-06 脚本整合 (v1.033) + max_tokens 机制解释
+
+Skills called: mattpocock-skills (bootstrap) → ask-matt (T0; 双意图:解释=无 lane / 脚本整合=Lane B) → to-spec (轻量,内嵌 slices) → tdd (缝 = cmd 真实运行三脚本断言端口状态) → code-review (doc-only → 内联双轴,substitution 已记)。
+
+- 意图①(解释,零改动):max_tokens 存在两层限制 —— 网关自身防御性截断 200000(gateway.mjs:823 `Math.min(openaiReq.max_tokens || 64000, 200000)`)与上游 per-model 上限(LongCat-2.0:free = 131072);压测 999999 → 截成 200000 → 上游拒绝。正常量级两层都碰不到,透传语义不受影响。已向用户说明;若要完全透传去掉 823 的 Math.min 即可(未实施,等用户表态)。
+- 意图②:根目录 5 个脚本整合为 启动网关/停止网关/重启网关 三个。实测抓出两个真问题:①杀守护 cmd 不会杀 node 子进程(无进程树击杀)→ 守护 3 秒后拉回,「停止」永远停不干净 → 改 `taskkill /T /F` 整树击杀 + 5 轮「击杀→验证」循环;②`timeout` 命令在 stdin 重定向下必挂 → 全部 ping 等待。编码红线落实:UTF-8 无 BOM + CRLF + chcp 65001 + powershell 命令行内无中文(守护匹配用 '--bg' 特征)。
+- 测试坑(记入 spec Notes):python subprocess 管道会被 bat 的隐藏孙进程握住写端 → communicate() 永久挂死,测试输出必须重定向文件;测试自身 netstat 需 bytes+replace 解码(中文 Windows 控制台 GBK)。
+- 偏差修正:spec 初稿断言旧脚本 `\"--bg\"` 比较恒不等会无限重生 —— 实测证伪(链收敛),按 comment-truth 规则改写为「语义不可读,行为等价重写」。
+- Verify: test_scripts.py 红(E0 重启网关缺失,EXIT=1)→ 绿 6/6 ×2 轮连续(EXIT=0);node --check + --version v1.0.33。
+
 ## 2026-09-06 push + longcat 压测排障 (v1.032)
 
 Skills called: mattpocock-skills (bootstrap) → ask-matt (T0; doc-only, 双意图拆分自答:推送=用户明示授权的 ops 动作 / 压测出现症状即 Lane D) → diagnosing-bugs (mock 反馈环红→绿)。
