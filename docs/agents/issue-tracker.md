@@ -1,6 +1,6 @@
 # Issue tracker — local markdown
 
-No git remote is configured; this is a solo repo. Issues live as files in this repo:
+Solo repo. Issues stay as local files in this repo (local-markdown tracker); the `origin` remote (`github.com/zkkk9555/cc-gateway`) is for publishing commits only — no GitHub Issues workflow. History was scrubbed of credentials before first push (2026-09-06, pre-push bundle kept at `C:\Project\cc-gateway-prepurge-20260906.bundle`).
 
 - Effort root: `.scratch/<slug>/` (slug = `<verb>-<object>-<constraint>`, English kebab-case)
 - Spec: `.scratch/<slug>/spec.md`

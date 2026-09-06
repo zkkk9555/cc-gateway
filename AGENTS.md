@@ -6,7 +6,7 @@
 
 ### Issue tracker
 
-Local markdown under `.scratch/<slug>/` — solo repo, no git remote. See `docs/agents/issue-tracker.md`.
+Local markdown under `.scratch/<slug>/` — solo repo; publishes to `github.com/zkkk9555/cc-gateway`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
