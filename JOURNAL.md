@@ -1,5 +1,16 @@
 # JOURNAL — cc-gateway 工程轮流水
 
+## 2026-09-06 透传 + 防误杀 + 体检 + 大压测 (v1.034)
+
+Skills called: mattpocock-skills (bootstrap) → ask-matt (T0; 四意图合一 effort) → to-spec → tdd (两缝红绿) → code-review (体检审计由 general-purpose 子代理承担 Standards+Spec 之外的第三轴:bug-hunt)。
+
+- 切片①:max_tokens 纯透传(用户明示)——gateway.mjs:823 删 `Math.min(...,200000)`,保留 `|| 64000` 缺省;mock 上游回显实收值,断言 999999 原样到达。红 3 → 绿 4/4。
+- 切片②:停止/重启 bat 守护匹配 `'--bg'` 单条件 → `'cc-gateway' AND '--bg'` 双条件(用户另有其他网关项目,防误杀是安全红线)。诱饵进程测试(cmd 带 --bg、非本网关)红 2 → 绿 8/8,诱饵全程存活。
+- 切片③体检:general-purpose 子代理全文件 bug-hunt,8 发现(1 HIGH 6 MED 1 LOW)全部修复:①HIGH——SOCKS5 隧道 10s 握手超时不解除,推理模型 >10s 静默被掐,直接解释了重负载冷启动 503(setTimeout(0) 修复);②messages/responses 提交后读循环无错误处理,中断流会产生畸形 SSE → try/catch + finalize() 优雅收尾;③logStream 无 error 监听 → 异步写失败无限 uncaughtException 环;④readWithTimeout 每 chunk 泄漏一个定时器 → finally 清理;⑤SOCKS5 失败路径漏 destroy;⑥sessions/keyStates 无界增长(500 FIFO 帽)+ poolCooldown 跳过透传 key;⑦客户端断连不再空烧 120s 重试窗(三 handler 守卫);⑧仪表盘测试端点超时泄漏 reader(finally)。
+- 压测(longcat,修复后):stress 25/25、heavy 19/19(冷启动第一波 14/15+133s 503 → **15/15 / 15.7s**,SOCKS5 修复直接见效)、aggressive 9/9(E 项测试预期修正:推理模型 max_tokens=5 必然空文本,改 300 + 事件数断言)。upstream 4/4、scripts 8/8。
+- 编排教训(记入 NOTES):test_scripts.py 会接管并清理 3050 端口,不能与主实例并存跑;曾导致 stress/heavy 打在死端口上全红(非产品 bug,重跑即正)。
+- Verify:五套测试 65 断言全绿(真实退出码);git 241e4d1 推送;网关停回原状。
+
 ## 2026-09-06 脚本整合 (v1.033) + max_tokens 机制解释
 
 Skills called: mattpocock-skills (bootstrap) → ask-matt (T0; 双意图:解释=无 lane / 脚本整合=Lane B) → to-spec (轻量,内嵌 slices) → tdd (缝 = cmd 真实运行三脚本断言端口状态) → code-review (doc-only → 内联双轴,substitution 已记)。
