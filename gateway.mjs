@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const VERSION = '1.0.31';
+const VERSION = '1.0.32';
 
 // ── CLI Args ────────────────────────────────────────────────────────────────
 
@@ -522,7 +522,7 @@ function parseUpstreamError(errText, status) {
 // Deterministic client/validation errors — retrying them for 120s just hammers
 // upstream and delays the inevitable failure. Transient errors ("Service
 // temporarily unavailable", "timed out", rate limits) never match these patterns.
-const PERMANENT_ERROR_RE = /invalid|must not be|not be empty|required|unsupported|not supported|unknown model|not found|too (large|long|many|big)|exceeds|permission|denied|unauthorized|malformed/i;
+const PERMANENT_ERROR_RE = /invalid|must not be|not be empty|required|unsupported|not supported|unknown model|not found|too (large|long|many|big)|exceeds|permission|denied|unauthorized|malformed|参数校验失败/i;
 
 function isRetryableUpstreamError(message) {
   return !PERMANENT_ERROR_RE.test(message || '');
@@ -1182,7 +1182,7 @@ async function collectCcStream(reader) {
             break;
           case 'error':
             text += '[ERROR: ' + (ev.error?.message || 'CC API error') + ']';
-            log('warn', `Upstream stream error event: ${ev.error?.message || 'CC API error'}`);
+            log('warn', `Upstream stream error event: ${ev.error?.message || 'CC API error'} (data: ${line.slice(0, 200)})`);
             break;
           case 'tool-error':
             log('warn', `Upstream tool error event: ${ev.error?.message || ev.message || JSON.stringify(ev).slice(0, 150)}`);
@@ -1303,7 +1303,7 @@ function createOpenAiTranslator(completionId, model) {
         cachedTokens = u.inputTokenDetails?.cacheReadTokens || 0;
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
-        log('warn', `Upstream stream error event: ${msg}`);
+        log('warn', `Upstream stream error event: ${msg} (data: ${line.slice(0, 200)})`);
         chunks.push({ ...base(), choices: [{ index: 0, delta: { content: '[ERROR: ' + msg + ']' }, finish_reason: 'stop' }] });
       } else if (type === 'finish') {
         const fr = ev.finishReason === 'length' ? 'length' : ev.finishReason === 'tool-calls' ? 'tool_calls' : 'stop';
@@ -1419,7 +1419,7 @@ function createAnthropicTranslator(messageId, model) {
                    : ev.finishReason === 'length' ? 'max_tokens' : 'end_turn';
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
-        log('warn', `Upstream stream error event: ${msg}`);
+        log('warn', `Upstream stream error event: ${msg} (data: ${line.slice(0, 200)})`);
         events.push(...closeBlock());
         events.push({ event: 'error', data: { type: 'error', error: { type: 'internal_error', message: msg } } });
       } else if (type === 'tool-error') {
@@ -1559,7 +1559,7 @@ function createResponsesTranslator(responseId, model) {
         // Stream end signal; response.completed is emitted by finalize()
       } else if (type === 'error') {
         const msg = ev.error?.message || 'CC API error';
-        log('warn', `Upstream stream error event: ${msg}`);
+        log('warn', `Upstream stream error event: ${msg} (data: ${line.slice(0, 200)})`);
         // Surface as output text so the client sees the failure, stream still completes
         if (openKind !== 'text') {
           openItem(events, 'text', { id: `msg_${randomUUID().slice(0, 12)}`, type: 'message', role: 'assistant', content: [] });
@@ -1712,27 +1712,36 @@ async function handleChatCompletions(req, res) {
       let earlyError = null;
       let permanentError = null;
 
-      // Read until we see content or error, then decide
+      // Read until we see content or error, then decide. The pre-buffer read
+      // must use the same timeout as the streaming phase — the default 60s
+      // killed reasoning models whose first event takes longer to arrive.
       const MAX_PRE_BUFFER = 20; // max events to buffer before committing
-      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
-        const { done, value } = await readWithTimeout(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        const chunks = translate(lines);
-        for (const chunk of chunks) {
-          const delta = chunk.choices?.[0]?.delta?.content || '';
-          const fr = chunk.choices?.[0]?.finish_reason;
-          if (delta.startsWith('[ERROR:')) {
-            if (isRetryableUpstreamError(delta)) earlyError = delta;
-            else permanentError = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
+      try {
+        for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+          const { done, value } = await readWithTimeout(reader, CFG.stream_timeout_ms || 120000);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          const chunks = translate(lines);
+          for (const chunk of chunks) {
+            const delta = chunk.choices?.[0]?.delta?.content || '';
+            const fr = chunk.choices?.[0]?.finish_reason;
+            if (delta.startsWith('[ERROR:')) {
+              if (isRetryableUpstreamError(delta)) earlyError = delta;
+              else permanentError = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
+            }
+            preHeadersChunks.push(chunk);
+            // If we got actual content or finish, stop buffering and commit
+            if ((delta && !delta.startsWith('[ERROR:')) || fr) break;
           }
-          preHeadersChunks.push(chunk);
-          // If we got actual content or finish, stop buffering and commit
-          if ((delta && !delta.startsWith('[ERROR:')) || fr) break;
+          if (permanentError || earlyError || (preHeadersChunks.some(c => c.choices?.[0]?.delta?.content && !c.choices[0].delta.content.startsWith('[ERROR:')))) break;
         }
-        if (permanentError || earlyError || (preHeadersChunks.some(c => c.choices?.[0]?.delta?.content && !c.choices[0].delta.content.startsWith('[ERROR:')))) break;
+      } catch (e) {
+        // No first event within stream_timeout_ms → transient: ride the retry
+        // window (next key may be faster) instead of dying with a bare 502.
+        if (e.message === 'Stream read timeout') earlyError = '[ERROR: Upstream timeout — no first event]';
+        else throw e;
       }
 
       // Permanent in-stream validation error — return immediately, no retry
@@ -1926,22 +1935,27 @@ async function handleMessages(req, res) {
       const preEvents = [];
       let earlyError = null, hasContent = false, permanentError = null;
       const MAX_PRE_BUFFER = 20;
-      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
-        const { done, value } = await readWithTimeout(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        preEvents.push(...translate(lines));
-        for (const ev of preEvents) {
-          if (ev.event === 'error') {
-            const msg = ev.data?.error?.message || 'CC API error';
-            if (isRetryableUpstreamError(msg)) earlyError = msg;
-            else permanentError = msg;
+      try {
+        for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+          const { done, value } = await readWithTimeout(reader, CFG.stream_timeout_ms || 120000);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          preEvents.push(...translate(lines));
+          for (const ev of preEvents) {
+            if (ev.event === 'error') {
+              const msg = ev.data?.error?.message || 'CC API error';
+              if (isRetryableUpstreamError(msg)) earlyError = msg;
+              else permanentError = msg;
+            }
+            else if (ev.event === 'content_block_delta' && (ev.data?.delta?.type === 'text_delta' || ev.data?.delta?.type === 'thinking_delta')) hasContent = true;
           }
-          else if (ev.event === 'content_block_delta' && (ev.data?.delta?.type === 'text_delta' || ev.data?.delta?.type === 'thinking_delta')) hasContent = true;
+          if (permanentError || earlyError || hasContent) break;
         }
-        if (permanentError || earlyError || hasContent) break;
+      } catch (e) {
+        if (e.message === 'Stream read timeout') earlyError = 'Upstream timeout — no first event';
+        else throw e;
       }
 
       // Permanent in-stream validation error — return immediately, no retry
@@ -2104,23 +2118,28 @@ async function handleResponses(req, res) {
       const preEvents = [];
       let earlyError = null, hasContent = false, permanentError = null;
       const MAX_PRE_BUFFER = 20;
-      for (let i = 0; i < MAX_PRE_BUFFER; i++) {
-        const { done, value } = await readWithTimeout(reader);
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        preEvents.push(...translate(lines));
-        for (const ev of preEvents) {
-          const delta = ev.event === 'response.output_text.delta' ? String(ev.data?.delta || '') : null;
-          if (delta?.startsWith('[ERROR:')) {
-            const msg = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
-            if (isRetryableUpstreamError(msg)) earlyError = msg;
-            else permanentError = msg;
+      try {
+        for (let i = 0; i < MAX_PRE_BUFFER; i++) {
+          const { done, value } = await readWithTimeout(reader, CFG.stream_timeout_ms || 120000);
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+          preEvents.push(...translate(lines));
+          for (const ev of preEvents) {
+            const delta = ev.event === 'response.output_text.delta' ? String(ev.data?.delta || '') : null;
+            if (delta?.startsWith('[ERROR:')) {
+              const msg = delta.replace(/^\[ERROR: /, '').replace(/]$/, '');
+              if (isRetryableUpstreamError(msg)) earlyError = msg;
+              else permanentError = msg;
+            }
+            else if (ev.event === 'response.output_text.delta' || ev.event === 'response.reasoning_summary_text.delta') hasContent = true;
           }
-          else if (ev.event === 'response.output_text.delta' || ev.event === 'response.reasoning_summary_text.delta') hasContent = true;
+          if (permanentError || earlyError || hasContent) break;
         }
-        if (permanentError || earlyError || hasContent) break;
+      } catch (e) {
+        if (e.message === 'Stream read timeout') earlyError = 'Upstream timeout — no first event';
+        else throw e;
       }
 
       // Permanent in-stream validation error — return immediately, no retry

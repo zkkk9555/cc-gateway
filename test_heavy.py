@@ -7,7 +7,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://127.0.0.1:3050"
-MODEL = "poolside/laguna-s-2.1-free"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "poolside/laguna-s-2.1-free"
 PASS = FAIL = 0
 FAILURES = []
 PRINT_LOCK = threading.Lock()

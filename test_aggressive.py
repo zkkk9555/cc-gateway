@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """cc-gateway aggressive stress test — targeting weak points found in round 1."""
-import json, time, threading
+import json, time, sys, threading
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://127.0.0.1:3050"
-MODEL = "poolside/laguna-s-2.1-free"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "poolside/laguna-s-2.1-free"
 PASS = FAIL = 0
 
 def log(ok, name, detail="", elapsed=0):

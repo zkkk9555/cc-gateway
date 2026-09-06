@@ -6,7 +6,7 @@ from urllib.error import HTTPError, URLError
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE = "http://127.0.0.1:3050"
-MODEL = "poolside/laguna-s-2.1-free"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "poolside/laguna-s-2.1-free"
 RESULTS = []
 ERRORS = []
 
@@ -351,13 +351,18 @@ def test_phase5():
     except Exception as e:
         log("P5", "Abort mid-stream", True, f"error handled: {str(e)[:60]}", time.time()-t0)
 
-    # 5b. Very large max_tokens
+    # 5b. Very large max_tokens — upstream rejects oversized values; the gateway
+    # must fail FAST with a clean 400 (permanent error) instead of retry-storming
+    # for the whole 120s window
     t0 = time.time()
     try:
         body = {"model": MODEL, "messages": [{"role": "user", "content": "say OK"}], "max_tokens": 999999, "stream": True}
         resp = post("/v1/chat/completions", body, timeout=30)
         text, events, err, fin = read_stream(resp, max_events=50)
         log("P5", "Huge max_tokens (999999)", True, f"events={events} text='{text[:30]}'", time.time()-t0)
+    except HTTPError as e:
+        ok = e.code in (400, 413)
+        log("P5", "Huge max_tokens (999999)", ok, f"clean fast rejection: {e.code} ({time.time()-t0:.1f}s)", time.time()-t0)
     except Exception as e:
         log("P5", "Huge max_tokens (999999)", False, str(e)[:100], time.time()-t0)
 
