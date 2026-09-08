@@ -49,3 +49,11 @@ Skills called: mattpocock-skills (v48 重读,用户升级后明示重读;引用/
 - 实测:meta/muse-spark-1.3-contributor ✅(3 事件,finish=length,推理预算内)、deepseek/deepseek-v4-flash ✅(66 事件,直连路由)、gpt-5.6-luna ✅(30 事件,finish=stop,代理路由)——直连/代理/推理/标准四条路径全覆盖,3/3。
 - v48 合规:WORKFLOW-ACTIVE 标记建立(工程轮次:5)并于收尾删除;AGENTS.md 补写常驻召回入口(setup 判据回补);本会话第 1 次 [反思] 已追加中央日志(第 3-4 轮早于规则存在,宁多勿少原则下本轮补触发)。
 - Verify:PAID SMOKE 3/3 EXIT=0;网关停回原状。
+
+## 2026-09-08 思考档位探查 (无版本号,只读探查轮)
+
+Skills called: mattpocock-skills (V2.010 重读,references 全新版) → ask-matt (T0; 无裁决,按 prelane 自落子) → research 未调(量化门:外部事实 0 处,探查数据来自自家网关实测,非外部事实)。
+
+- Gate 0: reasoning_effort 透传机制已实现(gateway.mjs:906/999-1002/1058),本轮探查上游行为、不改代码 → 无 lane(只读探查+结论报告)。
+- 15 个小请求探出:上游枚举 low/medium/high/xhigh/max(非法值探针原话,三模型一致);网关纯透传,5 档全可用。小预算下各档无分级差异;muse-spark 全档 length(思考吃掉预算,正常形态);真正分级需难题+大预算,未做(用户省 token 约束)。
+- Verify:探查脚本原文输出(EXIT=0)即证据;结论落 .scratch/reasoning-effort-probe/NOTES.md + probe-result.json;网关运行中保持(轮前即在运行,探查结束未停机——与此前轮次停机习惯不同,因用户日常即用网关)。
